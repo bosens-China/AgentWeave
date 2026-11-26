@@ -359,7 +359,7 @@ export async function workspaceState<S, T>(
   writing = false,
 ): Promise<T> {
   await mkdir(root, { recursive: true, mode: 0o700 })
-  const release = await lockfile.lock(root, {
+  const release = await lockfile.lock(join(root, '.workspace.lock'), {
     realpath: false,
     lockfilePath: join(root, '.workspace.lock'),
     stale: 120000,
