@@ -20,6 +20,18 @@ export function isSkillName(name: unknown): name is string {
   )
 }
 
+export function skillNameProblem(name: unknown): string {
+  if (typeof name !== 'string' || !name.length) return 'name 必须是非空文本'
+  if ([...name].length > 64)
+    return `name 最多 64 个字符；当前 ${[...name].length} 个字符`
+  if (/[A-Z]/u.test(name)) return 'name 不能包含大写字母，请使用小写字母'
+  if (/[^a-z0-9-]/u.test(name))
+    return 'name 只能包含小写字母、数字和连字符（-）'
+  if (name.startsWith('-') || name.endsWith('-'))
+    return 'name 不能以连字符（-）开头或结尾'
+  return 'name 不能包含连续的连字符（--）'
+}
+
 const binaryControls = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u
 
 export function skillFrontmatter(text: string) {
@@ -56,21 +68,20 @@ export function validateImport(resource: Resource): Resource {
     if (!isMap(yaml.contents))
       throw new Error('SKILL.md 的 YAML 元数据必须是键值对')
     const name = yaml.get('name')
-    if (!isSkillName(name))
-      throw new Error(
-        'SKILL.md 的 name 需为 1–64 个小写字母、数字或分隔用的连字符',
-      )
+    if (!isSkillName(name)) throw new Error(skillNameProblem(name))
     if (name !== resource.id)
       throw new Error(
         `SKILL.md 的 name「${name}」必须与目录名「${resource.id}」一致`,
       )
     const description = yaml.get('description')
-    if (
-      typeof description !== 'string' ||
-      !description.trim() ||
-      [...description].length > 1024
-    )
-      throw new Error('SKILL.md 的 description 必须是 1–1024 个字符的非空文本')
+    if (typeof description !== 'string' || !description.trim())
+      throw new Error(
+        `description 必须是非空文本，最多 1024 个字符；当前 ${typeof description === 'string' ? [...description].length : 0} 个字符`,
+      )
+    if ([...description].length > 1024)
+      throw new Error(
+        `description 最多 1024 个字符；当前 ${[...description].length} 个字符`,
+      )
     return { ...resource, name }
   }
   if (resource.kind === 'instructions') instructionsText(resource.text)

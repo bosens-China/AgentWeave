@@ -8,15 +8,16 @@ import type {
 } from '@agentweave/protocol'
 import {
   object,
+  fingerprint,
   sortedObject,
   validFilePath,
   validResourceId,
 } from '../adapters/files.js'
 import { normalizeMcpConfig } from '../adapters/mcp-format.js'
+import { resourceDescription } from './resource-description.js'
 
 const kinds = ['skill', 'mcp', 'instructions', 'plugin']
 const formats = ['codex', 'portable', 'claude', 'cursor', 'antigravity', 'pi']
-const maxPackageBytes = 32 * 1024 * 1024
 
 export function resourceKey(resource: Pick<Resource, 'kind' | 'id'>) {
   return `${resource.kind}:${resource.id}`
@@ -30,7 +31,6 @@ export function normalizeResource(value: unknown): Resource {
     !validResourceId(value.id) ||
     typeof value.name !== 'string' ||
     !value.name.trim() ||
-    value.name.length > 240 ||
     /[\x00-\x1f]/u.test(value.name)
   )
     throw new Error('资源需要有效的类型、标识和名称')
@@ -56,7 +56,6 @@ export function normalizeResource(value: unknown): Resource {
       Array.isArray(value.files)
     )
       throw new Error('资源需要文件内容')
-    let size = 0
     const paths = new Set<string>()
     const pathsByForm = new Map<string, string>()
     const files = Object.entries(value.files).sort(([left], [right]) =>
@@ -83,9 +82,6 @@ export function normalizeResource(value: unknown): Resource {
           pathsByForm.set(form, directory)
         }
         paths.add(normalized)
-        size += bytes.length
-        if (size > (maxPackageBytes * 4) / 3 + 4096)
-          throw new Error('资源超过 32 MB')
         return [path, bytes]
       }),
     )
@@ -218,7 +214,14 @@ export function compared(
         )
       )
         status = 'conflict'
-      return { ...candidate, status }
+      return {
+        ...candidate,
+        status,
+        contentHash: fingerprint(contentOf(candidate.resource)),
+        description: resourceDescription(candidate.resource),
+        ...(already &&
+          status === 'conflict' && { conflictWithRepository: true }),
+      }
     }),
   }
 }

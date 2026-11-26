@@ -1,6 +1,8 @@
 import type {
   Candidate,
   Resource,
+  ResourceKind,
+  ScanIssue,
   SyncChange,
   SyncPlan,
   Target,
@@ -8,16 +10,17 @@ import type {
 import { errorMessage } from '../errors.js'
 import { normalizeResource, sameContent } from '../central/resource.js'
 import { validateImport } from '../central/validation.js'
+import { resourceDescription } from '../central/resource-description.js'
 import type {
   FileOperation,
   NativeTarget,
+  PluginEntry,
   PluginOperation,
-  ResourceEntry,
   SectionPlan,
   SyncOptions,
 } from './types.js'
 import { homedir } from 'node:os'
-import { relative, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import {
   actualPath,
   applyFileOperations,
@@ -31,7 +34,13 @@ import { planInstructions, readInstructions } from './instructions.js'
 import { planMcp, readMcp } from './mcp.js'
 import { applyPluginOperations, planPlugins, readPlugins } from './plugins.js'
 import { planSkills, readSkills } from './skills.js'
-import { externalConsumers, resolveTargets, targetFor } from './targets.js'
+import { resolveTargets, targetFor } from './targets.js'
+
+function issueReason(error: unknown): string {
+  while (error instanceof Error && error.cause instanceof Error)
+    error = error.cause
+  return errorMessage(error)
+}
 
 export async function listTargets({ home = homedir() } = {}): Promise<
   Target[]
@@ -49,57 +58,154 @@ export async function listTargets({ home = homedir() } = {}): Promise<
   )
 }
 
+export type ScanSource = {
+  id: string
+  targetId: string
+  path: string
+  mcpId?: string
+  readOnly?: boolean
+  plugin?: { root: string; files?: string[] }
+}
+
 export async function scanTargets({
   home = homedir(),
   targetIds,
 }: { home?: string; targetIds?: string[] } = {}) {
   const targets = await resolveTargets({ home })
-  const selected = targetIds
-    ? [...new Set(targetIds)].map((id) => targetFor(targets, id))
-    : targets.filter((target) => target.detected)
+  const selected = (
+    targetIds
+      ? [...new Set(targetIds)].map((id) => targetFor(targets, id))
+      : targets
+  ).filter((target) => target.detected)
   const sections = await Promise.all(
     selected.map(async (target) => {
       const candidates: Candidate[] = []
       const warnings: string[] = []
+      const issues: ScanIssue[] = []
+      const sources: ScanSource[] = []
+      const warningRoots = new Map<
+        string,
+        { pluginRoot: string; builtin?: boolean }
+      >()
       function add({
         resource,
         path,
-      }: Pick<ResourceEntry, 'resource' | 'path'>) {
+        managedBy,
+      }: Pick<PluginEntry, 'resource' | 'path' | 'managedBy'>) {
+        const builtin = managedBy === 'builtin'
+        const id = fingerprint(
+          builtin
+            ? [target.id, path, resource, 'builtin']
+            : [target.id, path, resource],
+        )
+        sources.push({
+          id,
+          targetId: target.id,
+          ...(builtin && { readOnly: true }),
+          path:
+            resource.kind === 'skill' && !path.endsWith('.md')
+              ? join(path, 'SKILL.md')
+              : path,
+          ...(resource.kind === 'mcp' && { mcpId: resource.id }),
+          ...(resource.kind === 'plugin' && {
+            plugin: { root: path, files: Object.keys(resource.files ?? {}) },
+          }),
+        })
         try {
           const checked = normalizeResource(validateImport(resource))
-          const id = fingerprint([target.id, path, resource])
           candidates.push({
             id,
             targetId: target.id,
-            resource: { ...checked, tags: [target.id] },
+            ...(builtin && { builtin: true }),
+            resource: {
+              ...checked,
+              tags: builtin ? [target.id, '内置'] : [target.id],
+            },
           })
         } catch (error) {
-          warnings.push(
-            `${target.name} 的 ${resource.name}（${path}）：${errorMessage(error)}`,
-          )
+          const reason = issueReason(error)
+          const warning = `${target.name} 的 ${resource.name}（${path}）：${errorMessage(error)}`
+          warnings.push(warning)
+          issues.push({
+            id,
+            targetId: target.id,
+            kind: resource.kind,
+            name: resource.name,
+            description: resourceDescription(resource),
+            warning,
+            reason,
+            ...(builtin && { builtin: true }),
+            editable: true,
+          })
         }
       }
       async function scan<T>(
+        kind: ResourceKind,
         handler: () => Promise<T>,
         consume: (snapshot: T) => void,
       ) {
+        const before = warnings.length
         try {
           const snapshot = await handler()
           consume(snapshot)
         } catch (error) {
           warnings.push(`${target.name}：${errorMessage(error)}`)
         }
+        for (const warning of warnings.slice(before)) {
+          if (!issues.some((issue) => issue.warning === warning)) {
+            const id = fingerprint([target.id, kind, warning])
+            const warningSource = warningRoots.get(warning)
+            const pluginRoot = warningSource?.pluginRoot
+            const path =
+              pluginRoot ?? (kind === 'mcp' ? target.mcp?.path : undefined)
+            const name =
+              kind === 'mcp'
+                ? undefined
+                : warning.match(
+                    /的\s*(?:Skill|插件|本地包)\s+(.+?)(?:（|：)/,
+                  )?.[1]
+            if (path)
+              sources.push({
+                id,
+                targetId: target.id,
+                path,
+                ...(pluginRoot && { plugin: { root: pluginRoot } }),
+                ...(warningSource?.builtin && { readOnly: true }),
+              })
+            const detail =
+              warning.match(/^.*?）：([\s\S]*)$/)?.[1] ??
+              (name ? warning.match(/^.*?：([\s\S]*)$/)?.[1] : undefined) ??
+              (warning.startsWith(`${target.name}：`)
+                ? warning.slice(target.name.length + 1)
+                : warning)
+            issues.push({
+              id,
+              targetId: target.id,
+              kind,
+              name,
+              warning,
+              reason: detail.replace(/^(?:[^：\n]+\/)+[^：\n]+：\s*/u, ''),
+              ...(warningSource?.builtin && { builtin: true }),
+              editable: !!path,
+            })
+          }
+        }
       }
       if (target.plugin)
         await scan(
+          'plugin',
           () => readPlugins(target, { validate: true }),
-          ({ entries, warnings: messages }) => {
+          ({ entries, warnings: messages, warningSources: sourcePaths }) => {
             entries.forEach(add)
             warnings.push(...messages)
+            sourcePaths.forEach((source) =>
+              warningRoots.set(source.warning, source),
+            )
           },
         )
       if (target.instructions)
         await scan(
+          'instructions',
           () => readInstructions(target),
           ({ effective }) => {
             if (effective) add(effective)
@@ -107,14 +213,34 @@ export async function scanTargets({
         )
       if (target.mcp)
         await scan(
+          'mcp',
           () => readMcp(target),
-          ({ entries, warnings: messages }) => {
+          ({ entries, invalidEntries }) => {
             entries.forEach(add)
-            warnings.push(...messages)
+            for (const { id: mcpId, reason, warning } of invalidEntries) {
+              const id = fingerprint([target.id, 'mcp', warning])
+              warnings.push(warning)
+              issues.push({
+                id,
+                targetId: target.id,
+                kind: 'mcp',
+                name: mcpId,
+                reason,
+                warning,
+                editable: true,
+              })
+              sources.push({
+                id,
+                targetId: target.id,
+                path: target.mcp!.path,
+                mcpId,
+              })
+            }
           },
         )
       for (const directory of [target.skills, ...target.sharedSkills]) {
         await scan(
+          'skill',
           () => readSkills(directory, target),
           ({ entries, warnings: messages }) => {
             entries.forEach(add)
@@ -122,32 +248,83 @@ export async function scanTargets({
           },
         )
       }
-      return { candidates, warnings }
+      return { candidates, warnings, issues, sources }
     }),
   )
   const all = sections.flatMap((section) => section.candidates)
   const order = { plugin: 0, instructions: 1, mcp: 2, skill: 3 }
-  const components = new Map<string, Resource[]>()
-  for (const { resource } of all) {
-    for (const component of resource.components ?? []) {
-      const key = keyOf(component)
-      components.set(key, [...(components.get(key) ?? []), component])
+  const components = new Map<
+    string,
+    { plugin: Candidate; resource: Resource }[]
+  >()
+  const alternatives = new Map<
+    string,
+    { ids: Set<string>; labels: Set<string> }
+  >()
+  function conflict(left: Candidate, right: Candidate, component?: Resource) {
+    const related = alternatives.get(left.id) ?? {
+      ids: new Set<string>(),
+      labels: new Set<string>(),
+    }
+    related.ids.add(right.id)
+    const label = component
+      ? `${right.resource.name}（${component.kind === 'skill' ? 'Skill' : 'MCP'}「${component.id}」）`
+      : right.resource.name
+    related.labels.add(label)
+    alternatives.set(left.id, related)
+  }
+  for (const plugin of all) {
+    for (const resource of plugin.resource.components ?? []) {
+      const key = keyOf(resource)
+      const owners = components.get(key) ?? []
+      if (resource.kind === 'skill' || resource.kind === 'mcp') {
+        for (const other of owners) {
+          if (
+            other.plugin.id === plugin.id ||
+            sameContent(other.resource, resource)
+          )
+            continue
+          conflict(plugin, other.plugin, resource)
+          conflict(other.plugin, plugin, resource)
+        }
+      }
+      owners.push({ plugin, resource })
+      components.set(key, owners)
     }
   }
+  const annotated = all.map((candidate) => {
+    const owners = components.get(keyOf(candidate.resource)) ?? []
+    const bundledBy: string[] = []
+    for (const owner of owners) {
+      if (sameContent(owner.resource, candidate.resource))
+        bundledBy.push(owner.plugin.id)
+      else {
+        conflict(candidate, owner.plugin)
+        conflict(owner.plugin, candidate)
+      }
+    }
+    return bundledBy.length ? { ...candidate, bundledBy } : candidate
+  })
   return {
-    candidates: all
-      .filter(
-        ({ resource }) =>
-          resource.kind === 'plugin' ||
-          !components
-            .get(keyOf(resource))
-            ?.some((component) => sameContent(component, resource)),
-      )
+    candidates: annotated
+      .map((item) => {
+        const others = alternatives.get(item.id)
+        return others
+          ? {
+              ...item,
+              componentConflict: [...others.labels],
+              componentAlternatives: [...others.ids],
+            }
+          : item
+      })
       .sort(
         (first, second) =>
           order[first.resource.kind] - order[second.resource.kind],
       ),
+    targets: selected,
     warnings: [...new Set(sections.flatMap((section) => section.warnings))],
+    issues: sections.flatMap((section) => section.issues),
+    sources: sections.flatMap((section) => section.sources),
   }
 }
 
@@ -172,7 +349,7 @@ async function affectedConsumers(
   }
   for (const [path, kind] of locations) {
     const changed = await canonical(path)
-    for (const other of targets) {
+    for (const other of targets.filter((item) => item.detected)) {
       const otherLocations =
         kind === 'skill'
           ? [other.skills, ...other.sharedSkills]
@@ -181,8 +358,6 @@ async function affectedConsumers(
         if ((await canonical(location)) === changed) affected.add(other.name)
       }
     }
-    for (const name of externalConsumers.get(relative(target.home, path)) ?? [])
-      affected.add(name)
   }
   return [...affected]
 }
@@ -240,7 +415,31 @@ async function buildSyncPlan({
   ) {
     throw new Error('所选资源与本次同步类型不一致')
   }
-  for (const kind of syncKinds) {
+  const bundled = new Map<string, Resource[]>()
+  if (
+    target.plugin &&
+    !syncKinds.includes('plugin') &&
+    syncKinds.some((kind) => kind === 'skill' || kind === 'mcp')
+  ) {
+    try {
+      const snapshot = await readPlugins(target)
+      warnings.push(...snapshot.warnings)
+      for (const entry of snapshot.entries) {
+        if ('enabled' in entry && entry.enabled === false) continue
+        for (const component of entry.resource.components ?? []) {
+          const key = keyOf(component)
+          bundled.set(key, [...(bundled.get(key) ?? []), component])
+        }
+      }
+    } catch (error) {
+      warnings.push(
+        `无法核对 ${target.name} 的插件组件，本次按独立资源处理：${errorMessage(error)}`,
+      )
+    }
+  }
+  for (const kind of [...syncKinds].sort(
+    (a, b) => Number(b === 'plugin') - Number(a === 'plugin'),
+  )) {
     const desired = new Map<string, Resource>()
     for (const resource of selectedResources) {
       if (!object(resource) || resource.kind !== kind) continue
@@ -253,6 +452,23 @@ async function buildSyncPlan({
       if (desired.has(resource.id))
         throw new Error(`中央仓库中存在重复资源：${keyOf(resource)}`)
       desired.set(resource.id, resource)
+    }
+    if (!selective && (kind === 'skill' || kind === 'mcp')) {
+      for (const plugin of resources.filter((r) => r.kind === 'plugin')) {
+        for (const component of plugin.components ?? []) {
+          if (component.kind !== kind) continue
+          const existing = desired.get(component.id)
+          if (existing && !sameContent(existing, component))
+            throw new Error(
+              `插件 ${plugin.name} 和另一份 ${component.name} 内容不同，请选择单项分发要保留的版本。`,
+            )
+          desired.set(component.id, component)
+        }
+      }
+    }
+    for (const [id, item] of desired) {
+      if (bundled.get(keyOf(item))?.some((c) => sameContent(c, item)))
+        desired.delete(id)
     }
     let section: SectionPlan
     if (kind === 'skill') {
@@ -286,6 +502,10 @@ async function buildSyncPlan({
         selective,
         warnings,
       )
+      for (const component of section.provided ?? []) {
+        const key = keyOf(component)
+        bundled.set(key, [...(bundled.get(key) ?? []), component])
+      }
     }
     changes.push(...section.changes)
     operations.push(...section.operations)
@@ -327,16 +547,39 @@ export async function applySync({
     const plan = await buildSyncPlan({ ...options, home })
     if (revision !== plan.output.revision)
       throw new Error('预览已过期，请重新预览同步差异')
-    await applyFileOperations(home, plan.operations)
-    try {
-      await applyPluginOperations(plan.target, plan.pluginOperations)
-    } catch (error) {
-      if (!plan.operations.length) throw error
-      throw new Error(
-        `已应用 ${plan.operations.length} 处文件变更，插件同步遇到问题。${errorMessage(error)}。请重新预览当前差异`,
-        { cause: error },
+    let operations = plan.operations
+    if (plan.pluginOperations.length) {
+      // The native CLI can edit the same configuration that stores independent MCP servers.
+      const mcpPath = plan.target.mcp?.path
+      const includesMcp = operations.some(
+        (operation) => operation.path === mcpPath,
       )
+      const servers = includesMcp
+        ? fingerprint((await readMcp(plan.target)).section)
+        : undefined
+      await applyPluginOperations(plan.target, plan.pluginOperations)
+      if (includesMcp) {
+        const fresh = await buildSyncPlan({ ...options, home })
+        const newServers = fingerprint((await readMcp(plan.target)).section)
+        const fileChanges = (changes: SyncChange[]) =>
+          changes.filter((change) => change.kind !== 'plugin')
+        if (
+          servers !== newServers ||
+          fingerprint(fileChanges(plan.output.changes)) !==
+            fingerprint(fileChanges(fresh.output.changes))
+        ) {
+          throw new Error('插件已同步，其他资源已变化，请重新预览。')
+        }
+        const updated = fresh.operations.find(
+          (operation) => operation.path === mcpPath,
+        )
+        if (!updated) throw new Error('插件已同步，请重新预览 MCP 变更。')
+        operations = operations.map((operation) =>
+          operation.path === mcpPath ? updated : operation,
+        )
+      }
     }
+    await applyFileOperations(home, operations)
     return plan.output
   })
 }

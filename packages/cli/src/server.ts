@@ -15,6 +15,7 @@ type ServerContext = Context<ServerEnv>
 const hostname = '127.0.0.1'
 const devUiUrl = `http://${hostname}:5173`
 const maxBodyBytes = 32 * 1024 * 1024
+const maxSaveBodyBytes = 128 * 1024 * 1024
 const uiRoot = fileURLToPath(new URL('../dist/ui', import.meta.url))
 const uiExtensions = new Set(['.html', '.js', '.css', '.svg', '.png', '.woff2'])
 const securityHeaders = {
@@ -37,9 +38,10 @@ function localHosts(c: ServerContext) {
   return [`${hostname}:${port}`, `localhost:${port}`]
 }
 
-async function readJson(c: ServerContext): Promise<unknown> {
-  if (Number(c.req.header('content-length')) > maxBodyBytes)
-    throw new RequestError('请求过大。', 413)
+async function readJson(c: ServerContext, limit: number): Promise<unknown> {
+  const tooLarge = `请求过大，最大允许 ${limit / (1024 * 1024)} MiB。`
+  if (Number(c.req.header('content-length')) > limit)
+    throw new RequestError(tooLarge, 413)
   const chunks: Uint8Array[] = []
   let size = 0
   const body = c.req.raw.body
@@ -47,7 +49,7 @@ async function readJson(c: ServerContext): Promise<unknown> {
     // 超限时先返回 413，再由 Node 适配器清理未读的请求体。
     for await (const chunk of body.values({ preventCancel: true })) {
       size += chunk.byteLength
-      if (size > maxBodyBytes) throw new RequestError('请求过大。', 413)
+      if (size > limit) throw new RequestError(tooLarge, 413)
       chunks.push(chunk)
     }
   }
@@ -107,8 +109,14 @@ export async function startServer(
     const { pathname } = new URL(c.req.url)
     if (!pathname.startsWith('/api/'))
       throw new RequestError('请求方法不受支持。', 405)
-    const body = await readJson(c)
-    const value = await service.run(pathname.slice('/api/'.length), body)
+    const action = pathname.slice('/api/'.length)
+    const body = await readJson(
+      c,
+      ['save-resource', 'save-scan-source'].includes(action)
+        ? maxSaveBodyBytes
+        : maxBodyBytes,
+    )
+    const value = await service.run(action, body)
     return c.body(JSON.stringify(value ?? null), 200, {
       'Content-Type': 'application/json; charset=UTF-8',
     })

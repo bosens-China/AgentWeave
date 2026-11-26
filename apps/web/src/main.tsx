@@ -13,11 +13,13 @@ import 'virtual:uno.css'
 import './styles.css'
 import type {
   Overview,
+  GithubStatus,
   Resource,
   ResourceKind,
   Scope,
 } from '@agentweave/protocol'
 import { errorMessage, request, resourceKey } from './api'
+import type { ImportFilter } from './import-selection'
 import { ImportDialog, useLocalScan, Welcome } from './import'
 import { AddGithubDialog, PageFailure } from './shared'
 
@@ -59,6 +61,7 @@ function AppShell() {
   const [error, setError] = useState('')
   const [checking, setChecking] = useState(false)
   const [addGithub, setAddGithub] = useState(false)
+  const [importFilter, setImportFilter] = useState<ImportFilter>('all')
   const [importOpen, setImportOpen] = useState(false)
   const [openedResource, setOpenedResource] = useState<{
     resource: Resource | null
@@ -67,8 +70,35 @@ function AppShell() {
   const [scope, setScope] = useState<Scope | null>(null)
   const overviewRevision = useRef(0)
   const firstImport = data?.initialized === false
-  const local = useLocalScan(firstImport)
+  const local = useLocalScan(data)
 
+  const [githubStatus, setGithubStatus] = useState<GithubStatus[]>([])
+  const [githubChecking, setGithubChecking] = useState(false)
+  const [githubRefresh, setGithubRefresh] = useState(0)
+  const [githubError, setGithubError] = useState('')
+  useEffect(() => {
+    if (!data?.sources.length) {
+      setGithubStatus([])
+      setGithubChecking(false)
+      setGithubError('')
+      return
+    }
+    const controller = new AbortController()
+    setGithubChecking(true)
+    setGithubError('')
+    request('check-github', {}, controller.signal)
+      .then((rows) => {
+        if (!controller.signal.aborted) setGithubStatus(rows)
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) setGithubError(errorMessage(error))
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setGithubChecking(false)
+      })
+    return () => controller.abort()
+  }, [data, githubRefresh])
+  const updates = githubStatus.filter((row) => row.status === 'update').length
   const load = useCallback(async (signal?: AbortSignal) => {
     const revision = ++overviewRevision.current
     setChecking(true)
@@ -109,9 +139,9 @@ function AppShell() {
     }
   }
 
-  function openImport() {
+  function openImport(filter: ImportFilter = 'all') {
+    setImportFilter(filter)
     setImportOpen(true)
-    if (!firstImport) local.refresh()
   }
 
   function previewResource(resource: Resource, plugin?: Resource) {
@@ -177,19 +207,33 @@ function AppShell() {
           {!data && !error && <Skeleton active />}
           {data && (
             <Suspense fallback={<Skeleton active />}>
-              {firstImport && (
+              {view === 'resources' && (
                 <Welcome
                   scanState={local}
                   onScan={openImport}
-                  onSkip={skipImport}
+                  targets={data.targets}
+                  onRestore={setScope}
+                  onSkip={firstImport ? skipImport : undefined}
                 />
+              )}
+              {githubError && (
+                <PageFailure
+                  error={githubError}
+                  onRetry={() => setGithubRefresh((n) => n + 1)}
+                />
+              )}
+              {view === 'resources' && !!updates && (
+                <Button href="#github" icon={<GithubOutlined />}>
+                  GitHub 有 {updates} 个来源可更新
+                </Button>
               )}
               {view === 'resources' && (
                 <ResourcesView
+                  workspacePath={data.workspacePath}
                   resources={data.resources}
                   firstImport={firstImport}
                   onAddGithub={() => setAddGithub(true)}
-                  onScan={openImport}
+                  onScan={() => openImport()}
                   onOpen={(resource, kind) => {
                     if (resource)
                       setOpenedResource({ resource, kind: resource.kind })
@@ -204,6 +248,9 @@ function AppShell() {
               {view === 'github' && (
                 <GithubView
                   sources={data.sources}
+                  status={githubStatus}
+                  checking={githubChecking}
+                  check={() => setGithubRefresh((n) => n + 1)}
                   onChanged={load}
                   onAdd={() => setAddGithub(true)}
                 />
@@ -221,6 +268,7 @@ function AppShell() {
           scanState={local}
           targets={data.targets}
           firstImport={firstImport}
+          filter={importFilter}
           onClose={() => setImportOpen(false)}
           onDone={load}
         />

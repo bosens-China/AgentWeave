@@ -10,27 +10,99 @@ import type {
   Tree,
 } from './types.js'
 import { readFile, readdir } from 'node:fs/promises'
-import { basename, isAbsolute, join } from 'node:path'
+import { basename, isAbsolute, join, relative } from 'node:path'
 import { parse as parseJsonc } from 'jsonc-parser'
 import { parse as parseToml } from 'smol-toml'
-import { pluginFromFiles, readPlugin } from '../central/plugin.js'
 import {
+  MissingPluginSkillsError,
+  pluginFromFiles,
+  readPlugin,
+} from '../central/plugin.js'
+import {
+  assertParents,
   checkName,
   fingerprint,
   keyOf,
   object,
   optional,
   pathState,
+  validFilePath,
 } from './files.js'
 import { encodeServer } from './mcp-format.js'
 import { executable, nativeName, safeNativeId } from './plugin-install.js'
 import { planPiPlugins, readPiPlugins } from './pi-plugins.js'
 
-type InventoryRecord = {
-  path: string
+type InventoryRecord = Pick<PluginEntry, 'path' | 'nativeId' | 'managedBy'> & {
   enabled: boolean
-  nativeId?: string
-  accountManaged?: boolean
+  bundledPath?: string
+}
+
+const bundledMarket = 'openai-bundled'
+const managedReason = {
+  builtin: '是平台内置插件，本次保留',
+  'unverified-bundle': '的随附清单无法核实，本次保留',
+  account: '由 Claude 账号同步，请在 Claude Code 中管理',
+} as const
+
+// Codex materializes its desktop marketplace under CODEX_HOME. A user marketplace
+// with the same name but a different configured source is a regular marketplace.
+async function codexBundledPackages(
+  root: string,
+  home: string,
+  marketplaces: unknown,
+): Promise<Map<string, string> | null> {
+  let directory = join(root, '.tmp', 'bundled-marketplaces', bundledMarket)
+  const registration = object(marketplaces)
+    ? marketplaces[bundledMarket]
+    : undefined
+  if (registration !== undefined) {
+    if (!object(registration) || typeof registration.source !== 'string')
+      return null
+    if (
+      registration.source_type !== 'local' ||
+      !isAbsolute(registration.source)
+    )
+      return new Map()
+    const trusted = [directory]
+    if (process.platform === 'darwin') {
+      for (const parent of ['/Applications', join(home, 'Applications')]) {
+        for (const app of ['ChatGPT.app', 'Codex.app'])
+          trusted.push(
+            join(parent, app, 'Contents/Resources/plugins', bundledMarket),
+          )
+      }
+    }
+    const source = registration.source
+    const match = trusted.find((path) => relative(source, path) === '')
+    if (!match) return new Map()
+    directory = match
+  }
+  const catalogPath = join(directory, '.agents', 'plugins', 'marketplace.json')
+  try {
+    const catalog: unknown = JSON.parse(await readFile(catalogPath, 'utf8'))
+    if (
+      !object(catalog) ||
+      catalog.name !== bundledMarket ||
+      !Array.isArray(catalog.plugins)
+    )
+      return null
+    const packages = new Map<string, string>()
+    for (const entry of catalog.plugins) {
+      if (!object(entry) || typeof entry.name !== 'string') return null
+      if (
+        object(entry.source) &&
+        entry.source.source === 'local' &&
+        typeof entry.source.path === 'string'
+      ) {
+        const path = entry.source.path.replace(/^\.\//, '')
+        if (!validFilePath(path)) return null
+        packages.set(entry.name, join(directory, path))
+      }
+    }
+    return packages
+  } catch {
+    return null
+  }
 }
 
 const base64 = (text: string) => Buffer.from(text).toString('base64')
@@ -54,6 +126,11 @@ async function readInventory(target: NativeTarget) {
     const contents = await optional(readFile, join(root, 'config.toml'))
     const parsed = contents ? parseToml(contents.toString()) : {}
     const installed = object(parsed.plugins) ? parsed.plugins : {}
+    const bundled = Object.keys(installed).some((id) =>
+      id.endsWith('@' + bundledMarket),
+    )
+      ? await codexBundledPackages(root, target.home, parsed.marketplaces)
+      : new Map<string, string>()
     for (const [nativeId, data] of Object.entries(installed)) {
       try {
         const [id, market] = safeNativeId(nativeId)
@@ -68,8 +145,17 @@ async function readInventory(target: NativeTarget) {
           .sort(sorted)
           .at(-1)
         if (!latest) throw new Error('插件缺少本机缓存，无法读取已安装内容')
+        let managedBy: InventoryRecord['managedBy']
+        let bundledPath: string | undefined
+        if (market === bundledMarket) {
+          bundledPath = bundled?.get(id)
+          if (bundledPath) managedBy = 'builtin'
+          else if (!bundled) managedBy = 'unverified-bundle'
+        }
         records.push({
           nativeId,
+          managedBy,
+          bundledPath,
           path: join(cache, latest),
           enabled: !object(data) || data.enabled !== false,
         })
@@ -120,7 +206,12 @@ async function readInventory(target: NativeTarget) {
           enabled:
             !object(settings.enabledPlugins) ||
             settings.enabledPlugins[nativeId] !== false,
-          accountManaged: market === 'synced',
+          managedBy:
+            market === 'builtin'
+              ? 'builtin'
+              : market === 'synced'
+                ? 'account'
+                : undefined,
         })
       } catch (error) {
         warnings.push(
@@ -141,6 +232,58 @@ async function readInventory(target: NativeTarget) {
   return { records, warnings }
 }
 
+// Some built-in install caches omit the Skills shipped in the desktop bundle.
+async function readInstalledPlugin(
+  home: string,
+  record: InventoryRecord,
+  kind: Exclude<NativePluginKind, 'pi'>,
+  validate: boolean,
+) {
+  const options = { format: kind, validate }
+  try {
+    return {
+      path: record.path,
+      resource: await readPlugin(record.path, options),
+    }
+  } catch (error) {
+    if (!(error instanceof MissingPluginSkillsError) || !record.bundledPath)
+      throw error
+    await assertParents(home, join(record.bundledPath, 'plugin.json'))
+    let versioned = false
+    for (const file of ['plugin.json', '.codex-plugin/plugin.json']) {
+      const readManifest = (directory: string) =>
+        optional((path) => readFile(path), join(directory, file))
+      const [installed, shipped] = await Promise.all([
+        readManifest(record.path),
+        readManifest(record.bundledPath),
+      ])
+      if (!installed && !shipped) continue
+      if (!installed || !shipped || !installed.equals(shipped)) throw error
+      const manifest: unknown = JSON.parse(
+        installed.toString('utf8').replace(/^\uFEFF/, ''),
+      )
+      if (
+        object(manifest) &&
+        typeof manifest.version === 'string' &&
+        manifest.version &&
+        manifest.name === record.nativeId?.split('@')[0]
+      )
+        versioned = true
+    }
+    if (!versioned) throw error
+    return {
+      path: record.bundledPath,
+      resource: await readPlugin(record.bundledPath, options),
+    }
+  }
+}
+
+type PluginWarningSource = {
+  warning: string
+  pluginRoot: string
+  builtin?: boolean
+}
+
 export async function readPlugins(
   target: NativeTarget,
   { validate = false } = {},
@@ -148,27 +291,43 @@ export async function readPlugins(
   if (!target.plugin) throw new Error(`${target.name} 不支持完整插件`)
   const { kind } = target.plugin
   if (kind === 'pi')
-    return { ...(await readPiPlugins(target)), kind: 'pi' as const }
+    return {
+      ...(await readPiPlugins(target)),
+      kind: 'pi' as const,
+      warningSources: [] as PluginWarningSource[],
+    }
   const { records, warnings } = await readInventory(target)
+  const warningSources: PluginWarningSource[] = []
   const entries: PluginEntry[] = []
   const unavailable = new Set<string>()
   for (const record of records.sort((a, b) => sorted(a.path, b.path))) {
     try {
-      const resource = await readPlugin(record.path, { format: kind, validate })
+      const { resource, path } = await readInstalledPlugin(
+        target.home,
+        record,
+        kind,
+        validate,
+      )
       if (resource) {
         checkName(resource.id)
         entries.push({
           ...record,
-          expected: await pathState(record.path),
+          path,
+          expected: await pathState(path),
           resource,
         })
       } else if (record.nativeId) throw new Error('无法识别插件清单')
     } catch (error) {
       if (record.nativeId)
         unavailable.add(record.nativeId.split('@')[0].toLowerCase())
-      warnings.push(
-        `${target.name} 的插件 ${record.nativeId ?? basename(record.path)}（${record.path}）：${errorMessage(error)}`,
-      )
+      const warning = `${target.name} 的插件 ${record.nativeId ?? basename(record.path)}（${record.path}）：${errorMessage(error)}`
+      warnings.push(warning)
+      if (validate)
+        warningSources.push({
+          warning,
+          pluginRoot: record.path,
+          builtin: record.managedBy === 'builtin',
+        })
     }
   }
   for (const message of warnings) {
@@ -176,7 +335,13 @@ export async function readPlugins(
     const token = message.match(/插件 ([a-zA-Z0-9_.-]+)@/)?.[1]
     if (token) unavailable.add(token.toLowerCase())
   }
-  return { entries, warnings, unavailable, kind: 'native' as const }
+  return {
+    entries,
+    warnings,
+    warningSources,
+    unavailable,
+    kind: 'native' as const,
+  }
 }
 
 function packagePayload(resource: Resource): Tree {
@@ -215,7 +380,9 @@ export function convertPlugin(
   const format = target.plugin.kind
   if (
     resource.format === format ||
-    (format === 'codex' && resource.format === 'portable')
+    (format === 'codex' &&
+      (resource.format === 'portable' ||
+        !!resource.files?.['.codex-plugin/plugin.json']))
   ) {
     if (
       !resource.files ||
@@ -316,8 +483,12 @@ export async function planPlugins(
   const changes: SectionPlan['changes'] = []
   const operations: SectionPlan['operations'] = []
   const pluginOperations: PluginOperation[] = []
+  const provided: Resource[] = []
+  const existingProvided: Resource[] = []
   const installed = new Map<string, PluginEntry[]>()
   for (const entry of snapshot.entries) {
+    if (entry.managedBy && entry.enabled)
+      existingProvided.push(...(entry.resource.components ?? []))
     const id = entry.resource.id.toLowerCase()
     installed.set(id, [...(installed.get(id) ?? []), entry])
   }
@@ -336,15 +507,21 @@ export async function planPlugins(
     }
     try {
       const current = entries[0]
+      if (current?.managedBy) {
+        warnings.push(`${resource.name} ${managedReason[current.managedBy]}`)
+        continue
+      }
       const payload = convertPlugin(resource, target, warnings)
       const beforeFingerprint = fingerprint(
         current ? packagePayload(current.resource) : null,
       )
-      if (current && beforeFingerprint === fingerprint(payload)) continue
-      if (current?.accountManaged) {
-        warnings.push(
-          `${resource.name} 由 Claude 账号同步，请在 Claude Code 中管理`,
-        )
+      const delivered = pluginFromFiles(payload.files, payload.modes, kind)
+      const keys = new Set(delivered?.components?.map(keyOf))
+      const components = (resource.components ?? []).filter((c) =>
+        keys.has(keyOf(c)),
+      )
+      if (current && beforeFingerprint === fingerprint(payload)) {
+        if (current.enabled) existingProvided.push(...components)
         continue
       }
       const path =
@@ -378,6 +555,7 @@ export async function planPlugins(
           ...payload,
         })
       changes.push(change)
+      provided.push(...components)
     } catch (error) {
       warnings.push(`${resource.name} → ${target.name}：${errorMessage(error)}`)
     }
@@ -386,9 +564,9 @@ export async function planPlugins(
     for (const [id, entries] of installed) {
       if (desiredNames.has(id)) continue
       for (const current of entries) {
-        if (current.accountManaged) {
+        if (current.managedBy) {
           warnings.push(
-            `${current.resource.name} 由 Claude 账号同步，请在 Claude Code 中管理`,
+            `${current.resource.name} ${managedReason[current.managedBy]}`,
           )
           continue
         }
@@ -418,9 +596,19 @@ export async function planPlugins(
     }
   if (pluginOperations.length && !(await executable(target))) {
     warnings.push(`缺少 ${target.name} 的命令行程序，当前只可扫描已安装插件`)
-    return { changes: [], operations: [], pluginOperations: [] }
+    return {
+      changes: [],
+      operations: [],
+      pluginOperations: [],
+      provided: existingProvided,
+    }
   }
-  return { changes, operations, pluginOperations }
+  return {
+    changes,
+    operations,
+    pluginOperations,
+    provided: [...existingProvided, ...provided],
+  }
 }
 
 export { applyPluginOperations } from './plugin-install.js'

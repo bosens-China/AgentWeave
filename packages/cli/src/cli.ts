@@ -37,7 +37,7 @@ const help = `AgentWeave
   agentweave sync AGENT KIND --apply     应用预览，确认后再改动目标
   agentweave github add URL              把 GitHub 资源加入中央仓库
   agentweave github check                检查已添加的 GitHub 来源
-  agentweave github sync SOURCE_ID [--replace-shared]
+  agentweave github sync SOURCE_ID [--yes] [--replace-shared]
   agentweave status                      查看启动检查结果
 
 全局选项  --root PATH  --json  --yes  --help  --version
@@ -104,42 +104,49 @@ async function chooseCandidates(
   candidates: ComparedCandidate[],
 ): Promise<Selection[]> {
   if (!candidates.length) return []
+  const bulk = candidates.filter((candidate) => !candidate.builtin)
   if (values.yes) {
-    if (candidates.some(({ status }) => status === 'conflict')) {
+    if (
+      bulk.some((c) => c.status === 'conflict' || c.componentConflict?.length)
+    ) {
       throw new Error('发现重名冲突，请交互选择要保留的版本。')
     }
-    return candidates.map(({ id }) => ({ id }))
+    return bulk.map(({ id }) => ({ id }))
   }
   if (!stdin.isTTY || !stdout.isTTY || values.json) {
     throw new Error('请在交互终端选择导入项，或在无冲突时显式传入 --yes。')
   }
-  candidates.forEach(({ resource, status, targetId }, index) => {
-    const label = { new: '新增', same: '合并来源', conflict: '重名冲突' }[
-      status
-    ]
-    print(
-      `${index + 1}. ${resource.name}  ${resource.kind} · ${targetId} · ${label}`,
-    )
-  })
+  candidates.forEach(
+    ({ resource, status, targetId, componentConflict, builtin }, index) => {
+      const label = componentConflict?.length
+        ? '组件冲突：' + componentConflict.join('、')
+        : { new: '新增', same: '合并来源', conflict: '重名冲突' }[status]
+      print(
+        `${index + 1}. ${resource.name}  ${resource.kind} · ${targetId} · ${label}${builtin ? ' · 内置' : ''}`,
+      )
+    },
+  )
   const answer = await question(
-    '输入要导入的序号（逗号分隔，all 选全部，直接回车跳过） ',
+    candidates.some((c) => c.builtin)
+      ? '输入要导入的序号（all 跳过内置插件，内置插件可单独输入序号，直接回车跳过） '
+      : '输入要导入的序号（逗号分隔，all 选全部，直接回车跳过） ',
   )
   if (!answer) return []
   if (
     /^all$/i.test(answer) &&
-    candidates.some(({ status }) => status === 'conflict')
+    bulk.some((c) => c.status === 'conflict' || c.componentConflict?.length)
   ) {
     throw new Error('有重名冲突，请用序号逐项选择保留的版本。')
   }
   const selected = /^all$/i.test(answer)
-    ? candidates
+    ? bulk
     : [...new Set(answer.split(/[,，\s]+/).map(Number))].map(
         (index) => candidates[index - 1],
       )
   if (selected.some((row) => !row)) throw new Error('导入序号无效。')
-  return selected.map(({ id, status }) => ({
+  return selected.map(({ id, conflictWithRepository }) => ({
     id,
-    replace: status === 'conflict',
+    replace: !!conflictWithRepository,
   }))
 }
 
@@ -256,7 +263,43 @@ async function main() {
             ),
       )
     }
-    if (values.json) return print(overview)
+    const [local, github] = await Promise.all([
+      run('scan'),
+      overview.sources.length ? run('check-github') : [],
+    ])
+    const added = new Set(
+      local.candidates
+        .filter(
+          (c) =>
+            c.status === 'new' &&
+            !c.componentConflict?.length &&
+            !c.bundledBy?.length,
+        )
+        .map((c) => c.resource.kind + ':' + c.resource.id),
+    ).size
+    const conflicts = new Set(
+      local.candidates
+        .filter((c) => c.status === 'conflict' || c.componentConflict?.length)
+        .map((c) => c.resource.kind + ':' + c.resource.id),
+    ).size
+    if (values.json)
+      return print({
+        ...overview,
+        local: {
+          added,
+          conflicts,
+          missing: local.missing,
+          issues: local.issues,
+        },
+        github,
+      })
+    print(
+      `本机新增 ${added} 项，冲突 ${conflicts} 项，已移除 ${local.missing?.length ?? 0} 项。运行 agentweave ui 可选择导入或恢复。`,
+    )
+    for (const source of github.filter((s) => s.status !== 'current'))
+      print(
+        `GitHub ${source.url}  ${source.status === 'update' ? '有更新' : source.error}`,
+      )
     print(
       `中央仓库 ${overview.resources.length} 项资源，已检测到 ${overview.targets.filter(({ detected }) => detected).length} 个 Agent。`,
     )
@@ -277,8 +320,8 @@ async function main() {
     return print([
       ...result.warnings.map((warning) => `提示  ${warning}`),
       ...result.candidates.map(
-        ({ id, status, targetId, resource }) =>
-          `${id}  ${targetId}  ${resource.name}  ${status}`,
+        ({ id, status, targetId, resource, componentConflict, builtin }) =>
+          `${id}  ${targetId}  ${resource.name}  ${status}${builtin ? '  内置' : ''}${componentConflict?.length ? `  组件版本不同：${componentConflict.join('、')}` : ''}`,
       ),
     ])
   }
@@ -426,29 +469,37 @@ async function main() {
   }
   if (command === 'github' && args[0] === 'sync') {
     const source = { id: args[1] }
-    let result = await run('sync-github', source)
-    if ('conflict' in result) {
-      if (!values['replace-shared']) {
-        if (values.json) return print(result)
-        print(result.conflict.message)
-        if (!stdin.isTTY || !stdout.isTTY)
-          throw new Error('请交互确认，或明确传入 --replace-shared。')
-        const answer = await question(
-          '使用 GitHub 新版本并解除其他来源关联？ [y/N] ',
-        )
-        if (!/^y(es)?$/i.test(answer)) return print('已保留中央版本。')
-      }
-      result = await run('sync-github', {
-        ...source,
-        replaceShared: result.conflict.token,
-      })
-      if ('conflict' in result) {
-        if (values.json) return print(result)
-        throw new Error(
-          `GitHub 更新已变化，请重新确认。\n${result.conflict.message}`,
-        )
-      }
+    const preview = await run('preview-github-update', source)
+    if (!values.json) {
+      for (const change of preview.changes)
+        print(`${change.action}  ${change.key}`)
+      if (preview.shared) print(preview.shared.message)
     }
+    if (
+      preview.shared &&
+      !values['replace-shared'] &&
+      (!stdin.isTTY || values.json)
+    ) {
+      if (values.json)
+        return print({ conflict: preview.shared, changes: preview.changes })
+      throw new Error('共享来源冲突，请明确传入 --replace-shared。')
+    }
+    if (!values.yes || (preview.shared && !values['replace-shared'])) {
+      if (!stdin.isTTY || !stdout.isTTY || values.json)
+        return print(
+          values.json ? preview : '以上为预览，传入 --yes 应用本次更新。',
+        )
+      if (
+        !/^y(es)?$/i.test(await question('确认应用以上变更到中央仓库？ [y/N] '))
+      )
+        return print('已取消。')
+    }
+    const result = await run('sync-github', {
+      ...source,
+      token: preview.token,
+      replaceShared: preview.shared?.token,
+    })
+    if ('conflict' in result) throw new Error('共享来源已变化，请重新预览')
     return print(values.json ? result : 'GitHub 资源已同步到中央仓库。')
   }
   throw new Error('未知命令，运行 agentweave --help 查看用法。')

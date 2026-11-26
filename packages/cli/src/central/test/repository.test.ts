@@ -169,6 +169,26 @@ describe('central repository', () => {
     expect(await repo.list()).toEqual([{ ...skill('one'), tags: ['codex'] }])
   })
 
+  it('preserves an independently created central file after GitHub stops supplying the identical file', async () => {
+    const source = parseGithubUrl('https://github.com/example/resources')
+    let revision = 'a'.repeat(40),
+      contents = [skill('manual')]
+    repo = createRepository(root, {
+      github: {
+        inspect: async () => ({ ...source, path: '', revision }),
+        read: async () => ({ resources: contents, warnings: [] }),
+      },
+    })
+    await repo.save(skill('manual'))
+    await repo.addGithub(source.url)
+    contents = []
+    revision = 'b'.repeat(40)
+    const preview = await repo.previewGithubUpdate(source.id)
+    expect(preview.changes).toEqual([{ key: 'skill:manual', action: 'unlink' }])
+    await repo.syncGithub(source.id, undefined, preview.token)
+    expect(await repo.list()).toEqual([{ ...skill('manual'), tags: ['本地'] }])
+  })
+
   it('asks before replacing a resource shared with another GitHub source', async () => {
     const first = parseGithubUrl('https://github.com/example/first')
     const second = parseGithubUrl('https://github.com/example/second')
@@ -230,4 +250,49 @@ describe('central repository', () => {
       keys: ['skill:other'],
     })
   })
+})
+
+it('previews GitHub removals and binds consent to both the remote and central versions', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agentweave-github-confirm-'))
+  try {
+    const source = parseGithubUrl('https://github.com/example/resources')
+    let revision = 'a'.repeat(40),
+      contents = [skill('retired'), skill('updated')]
+    const repo = createRepository(root, {
+      github: {
+        inspect: async () => ({ ...source, revision, path: '' }),
+        read: async () => ({ resources: contents, warnings: [] }),
+      },
+    })
+    await repo.addGithub(source.url)
+    revision = 'b'.repeat(40)
+    contents = [skill('added'), skill('updated', 'updated', 'New content')]
+    const first = await repo.previewGithubUpdate(source.id)
+    expect(first.changes).toEqual(
+      expect.arrayContaining([
+        { key: 'skill:retired', action: 'delete' },
+        { key: 'skill:added', action: 'add' },
+        { key: 'skill:updated', action: 'overwrite' },
+      ]),
+    )
+    expect((await repo.list()).map((r) => r.id)).toEqual(['retired', 'updated'])
+    revision = 'c'.repeat(40)
+    await expect(
+      repo.syncGithub(source.id, undefined, first.token),
+    ).rejects.toThrow('过期')
+    const second = await repo.previewGithubUpdate(source.id)
+    await repo.save(skill('personal'))
+    await expect(
+      repo.syncGithub(source.id, undefined, second.token),
+    ).rejects.toThrow('过期')
+    const final = await repo.previewGithubUpdate(source.id)
+    await repo.syncGithub(source.id, undefined, final.token)
+    expect((await repo.list()).map((r) => r.id)).toEqual([
+      'added',
+      'personal',
+      'updated',
+    ])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })

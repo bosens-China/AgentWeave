@@ -160,6 +160,10 @@ function piResource(payload: Tree, path: string, managedRoot: string) {
   return { resource, managed }
 }
 
+export function piPackageResource(tree: Tree, id: string) {
+  return piResource(tree, id, '').resource
+}
+
 export async function readPiPlugins(target: Pick<NativeTarget, 'plugin'>) {
   if (!target.plugin) throw new Error('缺少 Pi 插件配置目录')
   const root = target.plugin.root
@@ -206,11 +210,11 @@ export async function readPiPlugins(target: Pick<NativeTarget, 'plugin'>) {
   return { entries, warnings, packages, settings, settingsPath, expected }
 }
 
-function convert(resource: Resource, warnings: string[]): Tree {
+export function convertedPiTree(resource: Resource, warnings: string[]): Tree {
   if (resource.format === 'pi') {
     if (resource.unsupported?.includes('extensions'))
       warnings.push(`${resource.name} 含有 Pi 扩展，启用后会由 Pi 加载`)
-    return { files: resource.files ?? {}, modes: resource.modes ?? {} }
+    return withoutOwnership(resource)
   }
   const files: Tree['files'] = {}
   const modes: Record<string, number> = {}
@@ -269,6 +273,7 @@ export async function planPiPlugins(
   warnings: string[],
 ): Promise<SectionPlan> {
   if (!target.plugin) throw new Error('缺少 Pi 插件配置目录')
+  const provided: Resource[] = []
   const additions: FileOperation[] = []
   const cleanup = new Map<string, FileOperation>()
   const changes: SectionPlan['changes'] = []
@@ -296,13 +301,21 @@ export async function planPiPlugins(
     }
     const current = found[0]
     try {
-      const converted = withoutOwnership(convert(resource, warnings))
+      const converted = withoutOwnership(convertedPiTree(resource, warnings))
+      const keys = new Set(
+        piPackageResource(converted, resource.id).components?.map(keyOf),
+      )
+      const components = (resource.components ?? []).filter((c) =>
+        keys.has(keyOf(c)),
+      )
       if (
         current &&
         fingerprint(withoutOwnership(current.resource)) ===
           fingerprint(converted)
-      )
+      ) {
+        provided.push(...components)
         continue
+      }
       const payload = {
         files: {
           ...converted.files,
@@ -334,6 +347,7 @@ export async function planPiPlugins(
           : path
         discard(current)
       } else packages.push(path)
+      provided.push(...components)
       changes.push({
         action: current ? 'overwrite' : 'add',
         key: keyOf(resource),
@@ -367,5 +381,5 @@ export async function planPiPlugins(
       beforeFingerprint: fingerprint(snapshot.settings),
     })
   operations.push(...cleanup.values())
-  return { changes, operations, pluginOperations: [] }
+  return { changes, operations, pluginOperations: [], provided }
 }

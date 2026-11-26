@@ -9,7 +9,11 @@ import {
   readPlugin,
 } from '../plugin.js'
 import { decodeServer } from '../../adapters/mcp-format.js'
-import { parseGithubUrl, resolveGithubRevision } from '../github.js'
+import {
+  parseGithubUrl,
+  resolveGithubRevision,
+  selectedEntries,
+} from '../github.js'
 
 function encode(text: unknown) {
   return Buffer.from(
@@ -200,4 +204,20 @@ it('resolves GitHub refs with slashes and rejects non-GitHub resource locations'
   expect(() =>
     parseGithubUrl('https://github.com/owner/repo/issues/10'),
   ).toThrow('仓库')
+})
+
+it('bounds GitHub blob reads by selected bytes and file count before fetching contents', () => {
+  const entry = (path: string, size: number) =>
+    `100644 blob ${'a'.repeat(40)} ${size}\t${path}\0`
+  const scope = { directory: 'skill', name: 'skill' }
+  const limit = 64 * 1024 * 1024
+  const tree = entry('outside.bin', limit + 1) + entry('skill/one', limit)
+  expect(selectedEntries(Buffer.from(tree), scope).entries).toHaveLength(1)
+  expect(() =>
+    selectedEntries(Buffer.from(tree + entry('skill/two', 1)), scope),
+  ).toThrow('64 MiB')
+  const many = Array.from({ length: 4001 }, (_, i) =>
+    entry(`skill/${i}`, 0),
+  ).join('')
+  expect(() => selectedEntries(Buffer.from(many), scope)).toThrow('4000')
 })

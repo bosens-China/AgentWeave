@@ -51,7 +51,7 @@ export type ResourceEntry = {
 export type PluginEntry = ResourceEntry & {
   nativeId?: string
   enabled?: boolean
-  accountManaged?: boolean
+  managedBy?: 'builtin' | 'unverified-bundle' | 'account'
 }
 export type PluginOperation = {
   id: string
@@ -60,6 +60,7 @@ export type PluginOperation = {
   beforeFingerprint: string
 }
 export type SectionPlan = {
+  provided?: Resource[]
   changes: SyncChange[]
   operations: FileOperation[]
   pluginOperations?: PluginOperation[]

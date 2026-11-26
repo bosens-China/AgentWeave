@@ -19,7 +19,6 @@ const nativeManifests = {
 const nativeManifestPaths = Object.values(nativeManifests).flat()
 const portableSchema =
   /^https:\/\/agent-plugins\.org\/schemas\/[^/]+\/plugin\.schema\.json$/
-const maxPackageBytes = 32 * 1024 * 1024
 
 function toText(content: string) {
   return Buffer.from(content, 'base64')
@@ -214,6 +213,8 @@ function unsupportedComponents(
   )
 }
 
+export class MissingPluginSkillsError extends Error {}
+
 export function pluginFromFiles(
   files: Tree['files'],
   modes: Record<string, number> = {},
@@ -252,7 +253,9 @@ export function pluginFromFiles(
       format !== 'portable' &&
       !skills.length
     )
-      throw new Error(`插件声明的 Skills 路径 ${path} 下未找到 SKILL.md`)
+      throw new MissingPluginSkillsError(
+        `插件声明的 Skills 路径 ${path} 下未找到 SKILL.md`,
+      )
     for (const { directory, resource } of skills) {
       components.set(
         `skill:${resource.id}`,
@@ -449,7 +452,6 @@ export async function readPlugin(
   )
     return null
   const { files, modes } = await readTree(directory, {
-    maxBytes: maxPackageBytes,
     maxFiles: Infinity,
   })
   return pluginFromFiles(files, modes, format, validate)

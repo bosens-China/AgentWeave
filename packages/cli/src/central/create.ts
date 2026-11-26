@@ -1,4 +1,4 @@
-import { isSkillName } from './validation.js'
+import { isSkillName, skillNameProblem } from './validation.js'
 
 function requiredText(value: unknown, label: string) {
   if (typeof value !== 'string' || !value.trim())
@@ -12,10 +12,12 @@ export function newResource(input: Record<string, unknown>) {
   const base = { kind, id, name: id, tags }
   if (kind === 'skill') {
     if (!isSkillName(id))
-      throw new Error('Skill 标识需为 1–64 个小写字母、数字或分隔用的连字符。')
+      throw new Error(skillNameProblem(id).replace(/^name/u, 'Skill 标识'))
     const description = requiredText(input.description, 'Skill 描述')
     if ([...description].length > 1024)
-      throw new Error('Skill 描述最多 1024 个字符。')
+      throw new Error(
+        `Skill 描述最多 1024 个字符；当前 ${[...description].length} 个字符。`,
+      )
     const body = input.text
     if (typeof body !== 'string' || !body.trim())
       throw new Error('请填写 Skill 正文。')

@@ -64,7 +64,6 @@ export function validSegment(value: unknown): value is string {
   return (
     typeof value === 'string' &&
     value.length > 0 &&
-    value.length <= 240 &&
     !['.', '..', '.git'].includes(value.toLowerCase()) &&
     !/[<>:"/\\|?*\x00-\x1f]/u.test(value) &&
     !/[. ]$/u.test(value) &&
@@ -73,7 +72,7 @@ export function validSegment(value: unknown): value is string {
 }
 
 export function validResourceId(value: unknown): value is string {
-  return validSegment(value) && value.length <= 220 && !value.startsWith('.')
+  return validSegment(value) && !value.startsWith('.')
 }
 
 export function validFilePath(value: unknown): value is string {
@@ -97,8 +96,8 @@ function checkRelativePath(path: unknown) {
 export async function readTree(
   directory: string,
   {
-    maxBytes = 50 * 1024 * 1024,
-    maxFiles = 20000,
+    maxBytes = Infinity,
+    maxFiles = Infinity,
     ignoreDirectories = [] as string[],
   } = {},
 ): Promise<Tree> {
@@ -121,8 +120,11 @@ export async function readTree(
         const metadata = await lstat(absolute)
         bytes += metadata.size
         count += 1
-        if (bytes > maxBytes || count > maxFiles)
-          throw new Error('资源超过本地导入大小上限')
+        if (count > maxFiles)
+          throw new Error(
+            `资源文件数量超过上限：最多 ${maxFiles} 个，已发现 ${count} 个`,
+          )
+        if (bytes > maxBytes) continue
         Object.defineProperty(files, name, {
           value: (await readFile(absolute)).toString('base64'),
           enumerable: true,
@@ -135,6 +137,15 @@ export async function readTree(
     }
   }
   await read(directory, '')
+  if (bytes > maxBytes) {
+    const display = (size: number) =>
+      size >= 1024 * 1024
+        ? `${(size / (1024 * 1024)).toFixed(2)} MiB（${size} 字节）`
+        : `${size} 字节`
+    throw new Error(
+      `资源大小超过上限：最大 ${display(maxBytes)}，当前 ${display(bytes)}`,
+    )
+  }
   return Object.keys(modes).length ? { files, modes } : { files }
 }
 

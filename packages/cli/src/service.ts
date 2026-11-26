@@ -2,6 +2,7 @@ import type {
   Api,
   ApiAction,
   BundlePlan,
+  Candidate,
   Overview,
   Resource,
   ResourceKind,
@@ -9,11 +10,20 @@ import type {
 } from '@agentweave/protocol'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import { errorCode, errorMessage } from './errors.js'
-import { fingerprint, keyOf, object } from './adapters/files.js'
+import {
+  applyFileOperations,
+  assertParents,
+  fingerprint,
+  keyOf,
+  object,
+  pathState,
+  readTree,
+  validFilePath,
+} from './adapters/files.js'
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import lockfile from 'proper-lockfile'
 import {
   applySync,
@@ -21,12 +31,33 @@ import {
   previewSync,
   scanTargets,
 } from './adapters/index.js'
+import type { ScanSource } from './adapters/index.js'
 import { createRepository } from './central/index.js'
 import { readNpmBundle } from './central/npm-bundle.js'
 import { newResource } from './central/create.js'
 import { MCP_PROTOCOL_BASELINE } from './adapters/mcp-format.js'
+import { resolveTargets, targetFor } from './adapters/targets.js'
+import {
+  sameContent,
+  matching,
+  compared as compareResources,
+} from './central/resource.js'
+import { convertPlugin } from './adapters/plugins.js'
+import { convertedPiTree } from './adapters/pi-plugins.js'
+import { readMcp } from './adapters/mcp.js'
+import { patchMcpSource, previewMcpSource } from './adapters/mcp-source.js'
 
-type Settings = Pick<Overview, 'initialized' | 'profiles'>
+type LocalBinding = {
+  targetId: string
+  kind: ResourceKind
+  name: string
+  key: string
+  id: string
+  candidateId: string
+}
+type Settings = Pick<Overview, 'initialized' | 'profiles'> & {
+  bindings?: LocalBinding[]
+}
 
 export class RequestError extends Error {
   constructor(
@@ -128,10 +159,219 @@ export function createService({
     }
   }
 
-  async function scan(body: Record<string, unknown>) {
+  const scanSources = new Map<string, ScanSource>()
+
+  async function inbound(
+    candidates: Candidate[],
+    resources: Resource[],
+    bindings: LocalBinding[],
+    targets: Awaited<ReturnType<typeof resolveTargets>>,
+  ) {
+    return candidates.map((candidate) => {
+      const current = matching(resources, candidate.resource)
+      if (!current || sameContent(current, candidate.resource)) return candidate
+      if (
+        bindings.some(
+          (binding) =>
+            binding.candidateId === candidate.id &&
+            binding.key === keyOf(current),
+        )
+      )
+        return {
+          ...candidate,
+          resource: { ...current, tags: candidate.resource.tags },
+        }
+      if (current.kind !== 'plugin') return candidate
+      const target = targetFor(targets, candidate.targetId)
+      try {
+        const expected =
+          target.plugin?.kind === 'pi'
+            ? convertedPiTree(current, [])
+            : convertPlugin(current, target, [])
+        const actual = { ...candidate.resource.files }
+        if (target.plugin?.kind === 'pi')
+          delete actual['.agentweave-package.json']
+        if (
+          fingerprint([expected.files, expected.modes ?? {}]) ===
+          fingerprint([actual, candidate.resource.modes ?? {}])
+        )
+          return {
+            ...candidate,
+            resource: { ...current, tags: candidate.resource.tags },
+          }
+      } catch {
+        // An unconvertible package is compared in its original format.
+      }
+      return candidate
+    })
+  }
+
+  function remember(settings: Settings, item: Candidate, key: string) {
+    settings.bindings = (settings.bindings ?? []).filter(
+      (b) =>
+        !(
+          b.targetId === item.targetId &&
+          b.kind === item.resource.kind &&
+          b.id === item.resource.id
+        ),
+    )
+    settings.bindings.push({
+      targetId: item.targetId,
+      kind: item.resource.kind,
+      name: item.resource.name,
+      id: item.resource.id,
+      candidateId: item.id,
+      key,
+    })
+  }
+
+  async function scan(body: Record<string, unknown>, edited?: ScanSource) {
     const targetIds = stringList(body.targetIds, 'Agent', true)
-    const { candidates, warnings } = await scanTargets({ home, targetIds })
-    return { ...(await repository.compare(candidates)), warnings }
+    const { candidates, warnings, issues, sources, targets } =
+      await scanTargets({
+        home,
+        targetIds,
+      })
+    const resources = await repository.list()
+    const { bindings = [] } = await readSettings()
+    const compared = compareResources(
+      await inbound(candidates, resources, bindings, targets),
+      resources,
+    )
+    const components = resources.flatMap((plugin) =>
+      (plugin.components ?? []).map((resource) => ({ plugin, resource })),
+    )
+    compared.candidates.forEach((candidate, index) => {
+      const raw = candidates[index].resource
+      if (!matching(resources, raw)) {
+        const related = components.filter(
+          (item) => keyOf(item.resource) === keyOf(raw),
+        )
+        if (related.some((item) => sameContent(item.resource, raw)))
+          candidate.status = 'same'
+        else if (related.length) {
+          candidate.status = 'conflict'
+          candidate.componentConflict = [
+            ...new Set([
+              ...(candidate.componentConflict ?? []),
+              ...related.map((item) => item.plugin.name),
+            ]),
+          ]
+        }
+      }
+      if (candidate.status === 'new' && candidate.componentConflict?.length)
+        candidate.status = 'conflict'
+      candidate.resource = raw
+    })
+    const detected = targets
+    const availableKeys = new Set([
+      ...resources.map(keyOf),
+      ...components.map(
+        ({ plugin, resource }) => keyOf(plugin) + '/' + keyOf(resource),
+      ),
+    ])
+    const missing = bindings
+      .filter(
+        (b) =>
+          availableKeys.has(b.key) &&
+          detected.some((t) => t.id === b.targetId) &&
+          !issues.some((i) => i.targetId === b.targetId && i.kind === b.kind) &&
+          !candidates.some(
+            (c) =>
+              c.targetId === b.targetId &&
+              c.resource.kind === b.kind &&
+              c.resource.id === b.id,
+          ),
+      )
+      .map(({ key, targetId, kind, name }) => ({ key, targetId, kind, name }))
+
+    if (!targetIds) scanSources.clear()
+    else {
+      for (const [id, source] of scanSources)
+        if (targetIds.includes(source.targetId)) scanSources.delete(id)
+    }
+    for (const source of sources) scanSources.set(source.id, source)
+    const updated =
+      edited &&
+      sources.find(
+        (source) =>
+          source.targetId === edited.targetId &&
+          source.path === edited.path &&
+          source.mcpId === edited.mcpId,
+      )
+    return {
+      ...compared,
+      missing,
+      warnings,
+      issues,
+      ...(updated && { updatedId: updated.id }),
+    }
+  }
+
+  function findScanSource(id: string) {
+    const source = scanSources.get(id)
+    if (!source) throw new RequestError('资源已变化，请重新扫描。')
+    return source
+  }
+
+  async function pluginFiles(source: ScanSource) {
+    if (!source.plugin) throw new RequestError('该资源不是插件。')
+    await assertParents(home, join(source.plugin.root, 'placeholder'))
+    const info = await lstat(source.plugin.root)
+    if (!info.isDirectory()) throw new RequestError('插件目录无法读取。')
+    return (source.plugin.files ??= Object.keys(
+      (await readTree(source.plugin.root)).files,
+    ))
+  }
+
+  async function scanSource(source: ScanSource, filePath?: unknown) {
+    let path = source.path
+    if (source.plugin) {
+      if (
+        !validFilePath(filePath) ||
+        !(await pluginFiles(source)).includes(filePath)
+      )
+        throw new RequestError('请选择插件中的有效文件。')
+      path = join(source.plugin.root, filePath)
+      await assertParents(home, path)
+    } else if (filePath !== undefined)
+      throw new RequestError('该资源不支持选择文件。')
+    const info = await lstat(path)
+    if (!info.isFile()) throw new RequestError('只能编辑普通文件。')
+    const expected = await pathState(path)
+    const bytes = await readFile(path)
+    let content = ''
+    let binary = bytes.includes(0)
+    try {
+      if (!binary)
+        content = new TextDecoder('utf-8', {
+          fatal: true,
+          ignoreBOM: true,
+        }).decode(bytes)
+    } catch {
+      binary = true
+    }
+    const snapshot =
+      source.mcpId !== undefined
+        ? await readMcp(
+            targetFor(await resolveTargets({ home }), source.targetId),
+          )
+        : undefined
+    if (
+      snapshot &&
+      (snapshot.raw !== content || snapshot.expected !== expected)
+    )
+      throw new RequestError('文件已被修改，请重新扫描。')
+    return {
+      ...source,
+      path,
+      expected,
+      mode: info.mode & 0o777,
+      content,
+      binary,
+      snapshot,
+      revision: fingerprint([expected, bytes.toString('base64')]),
+    }
   }
 
   async function syncArgs(body: Record<string, unknown>, emptyAllowed = false) {
@@ -231,52 +471,144 @@ export function createService({
       }
     },
     async overview() {
-      const [settings, resources, sources, targets] = await Promise.all([
+      const [settings, { resources, sources }, targets] = await Promise.all([
         readSettings(),
-        repository.list(),
-        repository.listSources(),
+        repository.overview(),
         listTargets({ home }),
       ])
       const drift = await Promise.all(
-        settings.profiles.map(async ({ targetId, kinds }) => {
-          try {
-            return {
-              targetId,
-              ...(await previewSync({ home, targetId, kinds, resources })),
+        settings.profiles
+          .filter((p) => targets.some((t) => t.id === p.targetId && t.detected))
+          .map(async ({ targetId, kinds }) => {
+            try {
+              return {
+                targetId,
+                ...(await previewSync({ home, targetId, kinds, resources })),
+              }
+            } catch (error) {
+              return {
+                targetId,
+                changes: [],
+                warnings: [errorMessage(error)],
+                affectedTargets: [],
+                revision: null,
+              }
             }
-          } catch (error) {
-            return {
-              targetId,
-              changes: [],
-              warnings: [errorMessage(error)],
-              affectedTargets: [],
-              revision: null,
-            }
-          }
-        }),
+          }),
       )
       return {
-        ...settings,
+        initialized: settings.initialized,
+        profiles: settings.profiles,
+        workspacePath: join(repositoryRoot, 'codex'),
         resources,
         sources,
-        targets,
+        targets: targets.filter((t) => t.detected),
         drift,
         mcpProtocolBaseline: MCP_PROTOCOL_BASELINE,
       }
     },
     scan,
+    'list-scan-files': async (body) => {
+      const source = findScanSource(requiredString(body.id, '资源标识'))
+      return {
+        files: (await pluginFiles(source)).sort((a, b) => a.localeCompare(b)),
+      }
+    },
+    'read-scan-source': async (body) => {
+      const source = await scanSource(
+        findScanSource(requiredString(body.id, '资源标识')),
+        body.path,
+      )
+      return {
+        name:
+          source.mcpId !== undefined
+            ? `${source.mcpId} · ${basename(source.path)}`
+            : source.plugin
+              ? String(body.path)
+              : basename(source.path),
+        content:
+          source.mcpId !== undefined && source.snapshot
+            ? previewMcpSource(source.snapshot, source.mcpId)
+            : source.content,
+        revision: source.revision,
+        ...(source.binary && { binary: true }),
+        ...(source.readOnly && { readOnly: true }),
+      }
+    },
+    'save-scan-source': (body) =>
+      mutate(async () => {
+        const origin = findScanSource(requiredString(body.id, '资源标识'))
+        // Recheck membership before writing, including plugins removed since preview.
+        const current = await scanTargets({
+          home,
+          targetIds: [origin.targetId],
+        })
+        const verified = current.sources.find((item) => item.id === origin.id)
+        if (!verified) throw new RequestError('资源已变化，请重新扫描。')
+        if (verified.readOnly)
+          throw new RequestError('内置插件由平台维护，导入原文件只供查看。')
+        const source = await scanSource(verified, body.path)
+        if (source.revision !== requiredString(body.revision, '文件版本'))
+          throw new RequestError('文件已被修改，请重新打开后再保存。')
+        if (typeof body.content !== 'string')
+          throw new RequestError('文件内容无效。')
+        if (source.binary) throw new RequestError('二进制文件不能在此编辑。')
+        const text =
+          source.mcpId !== undefined && source.snapshot
+            ? patchMcpSource(source.snapshot, source.mcpId, body.content)
+            : body.content
+        await applyFileOperations(home, [
+          {
+            path: source.path,
+            expected: source.expected,
+            text,
+            mode: source.mode,
+          },
+        ])
+        return scan({}, origin)
+      }),
     import: (body) =>
       mutate(async () => {
         const targetIds = stringList(body.targetIds, 'Agent', true)
         const selections = selectionsOf(body.selections)
+        const settings = await readSettings()
         let result: Resource[] = []
         if (selections.length) {
-          const { candidates } = await scanTargets({ home, targetIds })
-          result = await repository.import(candidates, selections)
+          const { candidates, targets } = await scanTargets({ home, targetIds })
+          const chosen = new Set(selections.map((s) => s.id))
+          if (
+            candidates.some(
+              (c) =>
+                chosen.has(c.id) &&
+                c.componentAlternatives?.some((id) => chosen.has(id)),
+            )
+          )
+            throw new RequestError(
+              '所选资源包含不同版本的同名组件，请选择要保留的版本。',
+            )
+          const redundant = new Set(
+            candidates
+              .filter((c) => c.bundledBy?.some((id) => chosen.has(id)))
+              .map((c) => c.id),
+          )
+          const selected = selections.filter((s) => !redundant.has(s.id))
+          result = await repository.import(
+            await inbound(
+              candidates,
+              await repository.list(),
+              settings.bindings ?? [],
+              targets,
+            ),
+            selected,
+          )
+          for (const item of candidates.filter((c) =>
+            selected.some((s) => s.id === c.id),
+          )) {
+            const stored = matching(result, item.resource)
+            if (stored) remember(settings, item, keyOf(stored))
+          }
         }
-        const settings = await readSettings()
-        if (!settings.initialized)
-          await saveSettings({ ...settings, initialized: true })
+        await saveSettings({ ...settings, initialized: true })
         return result
       }),
     'save-resource': (body) =>
@@ -310,13 +642,50 @@ export function createService({
         resources: await repository.list(),
       }),
     'apply-sync': (body) =>
-      mutate(async () =>
-        applySync({
-          ...(await syncArgs(body)),
-          resources: await repository.list(),
+      mutate(async () => {
+        const args = await syncArgs(body)
+        const resources = await repository.list()
+        const plan = await applySync({
+          ...args,
+          resources,
           revision: requiredString(body.revision, '同步预览'),
-        }),
-      ),
+        })
+        if (plan.changes.length) {
+          const settings = await readSettings()
+          const { candidates } = await scanTargets({
+            home,
+            targetIds: [args.targetId],
+          })
+          for (const change of plan.changes) {
+            if (change.action === 'delete') {
+              settings.bindings = settings.bindings?.filter(
+                (b) =>
+                  !(
+                    b.targetId === args.targetId &&
+                    b.kind === change.kind &&
+                    b.id === change.key.slice(change.kind.length + 1)
+                  ),
+              )
+              continue
+            }
+            const found = candidates.find(
+              (c) => keyOf(c.resource) === change.key,
+            )
+            if (!found) continue
+            const top = resources.find((r) => keyOf(r) === change.key)
+            const owner = resources.find((r) =>
+              r.components?.some((c) => keyOf(c) === change.key),
+            )
+            const key =
+              args.keys?.find(
+                (k) => k === change.key || k.endsWith('/' + change.key),
+              ) ?? (top ? change.key : owner && keyOf(owner) + '/' + change.key)
+            if (key) remember(settings, found, key)
+          }
+          await saveSettings(settings)
+        }
+        return plan
+      }),
     'preview-bundle': async (body) => (await bundlePlan(body)).result,
     'apply-bundle': (body) =>
       mutate(async () => {
@@ -348,6 +717,8 @@ export function createService({
         ),
       ),
     'check-github': () => repository.checkGithub(),
+    'preview-github-update': (body) =>
+      repository.previewGithubUpdate(requiredString(body.id, '来源标识')),
     'sync-github': (body) =>
       mutate(() =>
         repository.syncGithub(
@@ -355,6 +726,7 @@ export function createService({
           body.replaceShared === undefined
             ? undefined
             : requiredString(body.replaceShared, '冲突确认'),
+          requiredString(body.token, 'GitHub 更新预览'),
         ),
       ),
   } satisfies {

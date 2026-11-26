@@ -11,6 +11,8 @@ import { discoverResources } from './plugin.js'
 export type GithubSnapshot = ReturnType<typeof resolveGithubRevision>
 
 const maxBytes = 32 * 1024 * 1024
+const maxSelectedBytes = 64 * 1024 * 1024
+const maxSelectedFiles = 4000
 const commitPattern = /^[0-9a-f]{40}$/u
 
 export function parseGithubUrl(value: string) {
@@ -224,7 +226,7 @@ function selectedScope(snapshot: GithubSnapshot): {
   }
 }
 
-function selectedEntries(
+export function selectedEntries(
   tree: Buffer,
   scope: ReturnType<typeof selectedScope>,
 ) {
@@ -254,8 +256,8 @@ function selectedEntries(
     }
     const size = Number(bytes)
     total += size
-    if (total > maxBytes || entries.length >= 4000)
-      throw new Error('GitHub 资源超过大小限制，请指定更小的目录')
+    if (total > maxSelectedBytes || entries.length >= maxSelectedFiles)
+      throw new Error('GitHub 选区超过 64 MiB 或 4000 个文件，请指定更小的目录')
     entries.push({ path, mode, oid, size })
   }
   return { entries, unsupported }
@@ -301,10 +303,22 @@ export async function readGithub(snapshot: GithubSnapshot) {
       { cwd: directory },
     )
     const scope = selectedScope(snapshot)
-    const tree = await git(['ls-tree', '--full-tree', '-rlz', 'FETCH_HEAD'], {
-      cwd: directory,
-      limit: 8 * 1024 * 1024,
-    })
+    const path = scope.exact ?? scope.directory
+    const tree = await git(
+      [
+        '--literal-pathspecs',
+        'ls-tree',
+        '--full-tree',
+        '-rlz',
+        'FETCH_HEAD',
+        '--',
+        ...(path ? [path] : []),
+      ],
+      {
+        cwd: directory,
+        limit: 8 * 1024 * 1024,
+      },
+    )
     const { entries, unsupported } = selectedEntries(tree, scope)
     const unsupportedDefinition = unsupported.find((path) =>
       [
@@ -320,7 +334,7 @@ export async function readGithub(snapshot: GithubSnapshot) {
     const batch = await git(['cat-file', '--batch'], {
       cwd: directory,
       input: entries.map(({ oid }) => `${oid}\n`).join(''),
-      limit: maxBytes + 512 * 1024,
+      limit: maxSelectedBytes + 512 * 1024, // Allow for git cat-file record headers.
     })
     const { files, modes } = extractFiles(batch, entries)
     const warnings: string[] = []

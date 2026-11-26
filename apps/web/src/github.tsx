@@ -1,7 +1,11 @@
 import { useState } from 'react'
 import { Alert, App, Button, Empty, Tag } from 'antd'
 import { GithubOutlined, PlusOutlined, SyncOutlined } from '@ant-design/icons'
-import type { GithubSource, GithubStatus } from '@agentweave/protocol'
+import type {
+  GithubSource,
+  GithubStatus,
+  GithubUpdatePreview,
+} from '@agentweave/protocol'
 import { errorMessage, request } from './api'
 import { PageTitle } from './shared'
 
@@ -13,53 +17,82 @@ const statusTags = {
 
 export function GithubView({
   sources,
+  status,
+  checking,
+  check,
   onAdd,
   onChanged,
 }: {
   sources: GithubSource[]
+  status: GithubStatus[]
+  checking: boolean
+  check: () => void
   onAdd: () => void
   onChanged: () => void | Promise<void>
 }) {
   const { message, modal } = App.useApp()
-  const [status, setStatus] = useState<GithubStatus[]>([])
-  const [checking, setChecking] = useState(false)
   const [syncing, setSyncing] = useState<string | null>(null)
   const [syncError, setSyncError] = useState<{ id: string; message: string }>()
 
-  async function check() {
-    setChecking(true)
+  async function apply(id: string, preview: GithubUpdatePreview) {
+    setSyncing(id)
     try {
-      setStatus(await request('check-github'))
+      const result = await request('sync-github', {
+        id,
+        token: preview.token,
+        replaceShared: preview.shared?.token,
+      })
+      if ('conflict' in result) throw new Error('共享来源已变化，请重新预览')
+      message.success('已同步到中央仓库')
+      await onChanged()
     } catch (error) {
-      message.error(errorMessage(error))
+      setSyncError({ id, message: errorMessage(error) })
     } finally {
-      setChecking(false)
+      setSyncing(null)
     }
   }
 
-  async function sync(id: string, replaceShared?: string) {
+  async function sync(id: string) {
     setSyncing(id)
     setSyncError(undefined)
     try {
-      const result = await request('sync-github', { id, replaceShared })
-      if ('conflict' in result) {
-        modal.confirm({
-          title: '选择要保留的共享资源版本',
-          content: (
-            <div className="whitespace-pre-wrap wrap-anywhere">
-              {result.conflict.message}
-            </div>
-          ),
-          okText: '使用 GitHub 版本',
-          okButtonProps: { danger: true },
-          cancelText: '保留中央版本',
-          onOk: () => sync(id, result.conflict.token),
-        })
+      const preview = await request('preview-github-update', { id })
+      if (sources.find((s) => s.id === id)?.revision === preview.revision) {
+        message.info('中央仓库已是此来源的最新版本')
         return
       }
-      setStatus((previous) => previous.filter((item) => item.id !== id))
-      message.success('已同步到中央仓库')
-      await onChanged()
+      const labels = {
+        add: '新增',
+        overwrite: '覆盖',
+        delete: '删除',
+        link: '关联已有资源',
+        unlink: '解除来源关联',
+      }
+      modal.confirm({
+        title: '确认更新中央仓库',
+        content: (
+          <div>
+            <p>GitHub 版本 {preview.revision.slice(0, 8)}</p>
+            {preview.changes.length ? (
+              <ul>
+                {preview.changes.map((c) => (
+                  <li key={c.key}>
+                    {labels[c.action]} {c.key}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p>仅更新来源版本记录</p>
+            )}
+            {preview.shared && (
+              <p className="whitespace-pre-wrap">{preview.shared.message}</p>
+            )}
+          </div>
+        ),
+        okText: '确认更新',
+        cancelText: '取消',
+        onOk: () => apply(id, preview),
+      })
     } catch (error) {
       setSyncError({ id, message: errorMessage(error) })
     } finally {
@@ -155,7 +188,7 @@ export function GithubView({
                 disabled={checking || (!!syncing && syncing !== source.id)}
                 loading={syncing === source.id}
               >
-                同步到中央仓库
+                预览更新
               </Button>
             </div>
           )

@@ -1,3 +1,4 @@
+import { installedTarget } from './installed.js'
 import { errorCode } from '../errors.js'
 import { mcpTransports } from './mcp-format.js'
 import type { McpLocation, NativeTarget, TargetConfig } from './types.js'
@@ -223,11 +224,7 @@ export async function resolveTargets({ home = homedir() } = {}): Promise<
   return Promise.all(
     configs.map(async (target) => {
       const path = target.skills ?? join(target.root, 'skills')
-      const detected =
-        (await exists(target.root)) ||
-        (target.mcp !== undefined &&
-          ['claude', 'cline'].includes(target.id) &&
-          (await exists(target.mcp.path)))
+      const detected = await installedTarget(target.id, home)
       return {
         ...target,
         home,
@@ -247,12 +244,6 @@ export async function resolveTargets({ home = homedir() } = {}): Promise<
     }),
   )
 }
-
-export const externalConsumers = new Map([
-  [UNIVERSAL, ['Goose', 'Gemini CLI', 'OpenHands', 'Warp', 'Zed']],
-  [join('.agents', 'AGENTS.md'), ['Warp', 'Kimi Code']],
-  [join('.gemini', 'GEMINI.md'), ['Gemini CLI', 'Antigravity CLI']],
-])
 
 export function targetFor(targets: NativeTarget[], id: string) {
   const target = targets.find((candidate) => candidate.id === id)

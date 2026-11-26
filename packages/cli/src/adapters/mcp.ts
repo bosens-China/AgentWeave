@@ -56,7 +56,7 @@ export async function readMcp(target: NativeTarget) {
   if (!object(section))
     throw new Error(`${target.name} 的 MCP 配置区格式无效：${path}`)
   const entries = new Map<string, Pick<ResourceEntry, 'path' | 'resource'>>()
-  const warnings: string[] = []
+  const invalidEntries: { id: string; reason: string; warning: string }[] = []
   for (const [id, value] of Object.entries(section)) {
     try {
       checkName(id)
@@ -66,9 +66,12 @@ export async function readMcp(target: NativeTarget) {
         resource: { kind: 'mcp', id, name: id, config },
       })
     } catch (error) {
-      warnings.push(
-        `${target.name} 的 MCP ${id}（${path}）：${errorMessage(error)}`,
-      )
+      const reason = errorMessage(error)
+      invalidEntries.push({
+        id,
+        reason,
+        warning: `${target.name} 的 MCP ${id}（${path}）：${reason}`,
+      })
     }
   }
   return {
@@ -78,7 +81,8 @@ export async function readMcp(target: NativeTarget) {
     section,
     field,
     entries,
-    warnings,
+    invalidEntries,
+    warnings: invalidEntries.map(({ warning }) => warning),
     format,
     nativeTarget,
   }

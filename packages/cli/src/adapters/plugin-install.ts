@@ -1,9 +1,9 @@
-import { errorCode, errorMessage } from '../errors.js'
+import { agentExecutable } from './installed.js'
+import { errorMessage } from '../errors.js'
 import type { NativeTarget, PluginOperation, Tree } from './types.js'
 import { execFile } from 'node:child_process'
-import { constants } from 'node:fs'
-import { access, lstat, mkdir, readdir, rm } from 'node:fs/promises'
-import { delimiter, isAbsolute, join } from 'node:path'
+import { lstat, mkdir, readdir, rm } from 'node:fs/promises'
+import { join } from 'node:path'
 import { promisify } from 'node:util'
 import {
   applyFileOperations,
@@ -43,32 +43,9 @@ export function safeNativeId(value: string) {
 }
 
 export async function executable(target: NativeTarget) {
-  if (!target.plugin) return null
-  const app = target.plugin.kind
-  const paths = (process.env.PATH ?? '').split(delimiter).filter(isAbsolute)
-  if (process.platform === 'darwin' && app === 'codex')
-    paths.push(
-      '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS',
-    )
-  // Windows package-manager shims require a shell; only use actual executables as the native command.
-  const names = process.platform === 'win32' ? [`${app}.exe`] : [app]
-  for (const path of paths)
-    for (const name of names) {
-      try {
-        const possible = join(path, name)
-        await access(possible, constants.X_OK)
-        const file = await lstat(possible)
-        if (file.isFile() || file.isSymbolicLink()) return possible
-      } catch (error) {
-        if (
-          !['ENOENT', 'ENOTDIR', 'EACCES'].some(
-            (code) => errorCode(error) === code,
-          )
-        )
-          throw error
-      }
-    }
-  return null
+  return target.plugin
+    ? agentExecutable(target.plugin.kind, target.home, true)
+    : null
 }
 
 async function runNative(target: NativeTarget, binary: string, args: string[]) {

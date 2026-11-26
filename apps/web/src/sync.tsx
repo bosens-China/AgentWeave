@@ -48,7 +48,7 @@ export function AgentsView({
   const [saving, setSaving] = useState(false)
   const [targetId, setTargetId] = useState<string | null>(null)
   const [selection, setSelection] = useState<ResourceKind[] | null>(null)
-  const targets = data.targets
+  const targets = data.targets.filter((t) => t.detected)
   const target =
     targets.find(({ id }) => id === targetId) ??
     targets.find(({ detected }) => detected) ??
@@ -88,10 +88,10 @@ export function AgentsView({
           <div className="panel-heading">
             <h2>本机 Agent</h2>
             <span className="text-sm text-muted">
-              {targets.filter(({ detected }) => detected).length} /{' '}
-              {targets.length} 已检测
+              {targets.length} 个已检测
             </span>
           </div>
+          {!targets.length && <Empty description="尚未发现已安装的 Agent" />}
           {targets.map((item) => {
             const active = item.id === target?.id
             return (
@@ -197,7 +197,7 @@ export function AgentsView({
                   disabled={!kinds.length || !target.detected}
                   onClick={() => onPreview({ targetId: target.id, kinds })}
                 >
-                  预览同步
+                  从中央仓库对齐 {target.name}
                 </Button>
               </div>
             </div>
@@ -262,6 +262,7 @@ export function SyncDialog({
   onDone: () => void | Promise<void>
 }) {
   const { message } = App.useApp()
+  const [previewFailed, setPreviewFailed] = useState(false)
   const [targetId, setTargetId] = useState(scope.targetId)
   const [preview, setPreview] = useState<SyncPlan | null>(null)
   const [loading, setLoading] = useState(false)
@@ -282,8 +283,10 @@ export function SyncDialog({
     )
       .then(setPreview)
       .catch((error) => {
-        if (!(error instanceof Error && error.name === 'AbortError'))
+        if (!(error instanceof Error && error.name === 'AbortError')) {
+          setPreviewFailed(true)
           message.error(errorMessage(error))
+        }
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false)
@@ -306,7 +309,10 @@ export function SyncDialog({
       message.success('同步已应用')
       await onDone()
     } catch (error) {
-      if (preview) setPreview(null)
+      if (preview) {
+        setPreview(null)
+        setPreviewFailed(true)
+      }
       message.error(errorMessage(error))
     } finally {
       setLoading(false)
@@ -345,11 +351,21 @@ export function SyncDialog({
       }
       onCancel={onClose}
       onOk={advance}
-      okText={preview ? '确认并同步' : '预览变更'}
+      okText={
+        preview || (scope.targetId && !previewFailed)
+          ? scope.keys
+            ? '确认分发所选资源'
+            : '确认对齐所选类别'
+          : '预览变更'
+      }
       cancelText="关闭"
       confirmLoading={loading}
       okButtonProps={{
-        disabled: !targetId || (!!preview && !preview.changes.length),
+        disabled:
+          loading ||
+          !targetId ||
+          (!!scope.targetId && !preview && !previewFailed) ||
+          (!!preview && !preview.changes.length),
       }}
       closable={!loading}
       mask={{ closable: !loading }}

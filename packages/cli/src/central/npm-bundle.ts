@@ -25,7 +25,6 @@ const dependencies = [
 export async function readNpmBundle(from: string, root: string) {
   const directory = await realpath(resolve(from))
   const tree = await readTree(directory, {
-    maxBytes: 32 * 1024 * 1024,
     ignoreDirectories: ['node_modules'],
   })
   const manifest = tree.files['package.json']

@@ -1,9 +1,16 @@
+import {
+  suggestedLocalSelections,
+  toggleLocalSelection,
+} from '../../../../apps/web/src/import-selection.js'
+import { installFixtureAgents } from './installed-fixture.js'
 import { execFileSync } from 'node:child_process'
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, test } from 'vitest'
 import { pluginFromFiles } from '../central/plugin.js'
+import { readNpmBundle } from '../central/npm-bundle.js'
 import { previewSync } from '../adapters/index.js'
 import { startServer } from '../server.js'
 import { createService } from '../service.js'
@@ -13,6 +20,14 @@ const fixtureDirectories: string[] = []
 async function fixture() {
   const home = await mkdtemp(join(tmpdir(), 'agentweave-workflow-'))
   fixtureDirectories.push(home)
+  await installFixtureAgents(
+    home,
+    'cursor',
+    'codex',
+    'claude',
+    'qwen',
+    'opencode',
+  )
   return {
     home,
     service: createService({ home, root: join(home, 'AgentWeave') }),
@@ -44,6 +59,145 @@ afterEach(async () => {
 })
 
 describe('the local workflow', () => {
+  test('imports only checked resources', async () => {
+    const { home, service } = await fixture()
+    await writeSkill(home, '.cursor/skills', 'checked', 'Checked')
+    await writeSkill(home, '.cursor/skills', 'unchecked', 'Unchecked')
+    const scan = await service.run('scan', { targetIds: ['cursor'] })
+    const checked = scan.candidates.find(
+      (item) => item.resource.id === 'checked',
+    )!
+    const result = await service.run('import', {
+      targetIds: ['cursor'],
+      selections: [{ id: checked.id }],
+    })
+    expect(result.map((item) => item.id)).toEqual(['checked'])
+    expect(
+      (await service.run('overview')).resources.map((item) => item.id),
+    ).toEqual(['checked'])
+  })
+
+  test('imports the edited shared skill when the same agent also has a private copy', async () => {
+    const { home, service } = await fixture()
+    const privateFile = await writeSkill(
+      home,
+      '.cursor/skills',
+      'sample',
+      'Private',
+    )
+    await writeSkill(home, '.agents/skills', 'sample', 'Shared')
+    const scan = await service.run('scan', { targetIds: ['cursor'] })
+    const shared = scan.candidates.find(({ resource }) =>
+      Buffer.from(resource.files!['SKILL.md'], 'base64')
+        .toString()
+        .includes('Shared'),
+    )!
+    const source = await service.run('read-scan-source', { id: shared.id })
+    const edited = source.content.replace('Shared', 'Updated shared copy')
+    const next = await service.run('save-scan-source', {
+      id: shared.id,
+      revision: source.revision,
+      content: edited,
+    })
+    expect(next.updatedId).toBeDefined()
+    const [imported] = await service.run('import', {
+      selections: [{ id: next.updatedId }],
+    })
+    expect(Buffer.from(imported.files!['SKILL.md'], 'base64').toString()).toBe(
+      edited,
+    )
+    expect(await readFile(privateFile, 'utf8')).toContain('Private')
+  })
+
+  test('scans and imports a local plugin larger than 32 MiB', async () => {
+    const { home, service } = await fixture()
+    const plugin = join(home, '.cursor/plugins/local/large')
+    await mkdir(join(plugin, '.cursor-plugin'), { recursive: true })
+    await writeFile(
+      join(plugin, '.cursor-plugin/plugin.json'),
+      JSON.stringify({ name: 'large' }),
+    )
+    await writeFile(join(plugin, 'large.bin'), Buffer.alloc(33 * 1024 * 1024))
+    await writeSkill(
+      home,
+      '.cursor/plugins/local/large/skills',
+      'valid',
+      'Body',
+    )
+    await writeFile(
+      join(plugin, 'package.json'),
+      JSON.stringify({ name: 'large', version: '1.0.0' }),
+    )
+    expect(
+      (await readNpmBundle(plugin, join(home, 'AgentWeave'))).candidates.length,
+    ).toBeGreaterThan(0)
+    const scan = await service.run('scan', { targetIds: ['cursor'] })
+    const candidate = scan.candidates.find(
+      (item) => item.resource.id === 'large',
+    )
+    expect(candidate).toBeDefined()
+    const imported = await service.run('import', {
+      targetIds: ['cursor'],
+      selections: [{ id: candidate!.id }],
+    })
+    expect(imported[0].id).toBe('large')
+    expect(
+      Buffer.from(imported[0].files!['large.bin'], 'base64').byteLength,
+    ).toBe(33 * 1024 * 1024)
+    const { server, url } = await startServer(service, { port: 0 })
+    try {
+      const response = await fetch(`${url}/api/save-resource`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: url },
+        body: JSON.stringify({ resource: imported[0], replace: true }),
+      })
+      expect(response.status).toBe(200)
+      await response.body?.cancel()
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      )
+    }
+  }, 30000)
+
+  test('edits an invalid scanned skill and rescans it without overwriting external changes', async () => {
+    const { home, service } = await fixture()
+    const file = await writeSkill(home, '.cursor/skills', 'repair-me', 'Body')
+    await writeFile(file, '---\nname: repair-me\n---\nBody\n')
+    const first = await service.run('scan', {})
+    const issue = first.issues.find((item) => item.name === 'repair-me')
+    expect(issue).toMatchObject({
+      targetId: 'cursor',
+      kind: 'skill',
+      editable: true,
+    })
+    const source = await service.run('read-scan-source', { id: issue!.id })
+    await writeFile(file, 'changed externally')
+    await expect(
+      service.run('save-scan-source', {
+        id: issue!.id,
+        revision: source.revision,
+        content: 'replacement',
+      }),
+    ).rejects.toThrow()
+    expect(await readFile(file, 'utf8')).toBe('changed externally')
+    await writeFile(file, source.content)
+    const refreshed = await service.run('scan', {})
+    const current = refreshed.issues.find((item) => item.name === 'repair-me')!
+    const editable = await service.run('read-scan-source', { id: current.id })
+    const content = '---\nname: repair-me\ndescription: Fixed\n---\nBody\n'
+    const result = await service.run('save-scan-source', {
+      id: current.id,
+      revision: editable.revision,
+      content,
+    })
+    expect(await readFile(file, 'utf8')).toBe(content)
+    expect(result.issues.some((item) => item.name === 'repair-me')).toBe(false)
+    expect(
+      result.candidates.some((item) => item.resource.id === 'repair-me'),
+    ).toBe(true)
+  })
+
   test('reports malformed local files and offers only validated import candidates', async () => {
     const { home, service } = await fixture()
     await writeSkill(home, '.cursor/skills', 'valid-skill', 'Valid skill')
@@ -75,7 +229,19 @@ describe('the local workflow', () => {
       ),
     ])
     const targetIds = ['cursor', 'claude']
-    const { candidates, warnings } = await service.run('scan', { targetIds })
+    const { candidates, warnings, issues } = await service.run('scan', {
+      targetIds,
+    })
+    expect(issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'plugin', name: 'broken' }),
+        expect.objectContaining({
+          kind: 'mcp',
+          name: 'broken',
+          reason: expect.stringContaining('HTTP(S)'),
+        }),
+      ]),
+    )
     expect(candidates.map(({ resource }) => resource.id)).toEqual([
       'good',
       'valid-skill',
@@ -93,6 +259,31 @@ describe('the local workflow', () => {
       selections: candidates.map(({ id }) => ({ id })),
     })
     expect(imported).toHaveLength(2)
+  })
+
+  test('shows the underlying plugin validation reason without its file path', async () => {
+    const { home, service } = await fixture()
+    const plugin = join(home, '.cursor/plugins/local/contains-invalid')
+    await mkdir(join(plugin, '.cursor-plugin'), { recursive: true })
+    await writeFile(
+      join(plugin, '.cursor-plugin/plugin.json'),
+      JSON.stringify({ name: 'contains-invalid' }),
+    )
+    await writeSkill(
+      home,
+      '.cursor/plugins/local/contains-invalid/skills',
+      'bad',
+      'Body',
+    )
+    await writeFile(
+      join(plugin, 'skills/bad/SKILL.md'),
+      '---\nname: BAD\ndescription: test\n---\n',
+    )
+    const scan = await service.run('scan', { targetIds: ['cursor'] })
+    const issue = scan.issues.find((item) => item.name === 'contains-invalid')
+    expect(issue?.reason).toContain('name')
+    expect(issue?.reason).not.toContain('skills/bad/')
+    expect(issue?.warning).toContain('skills/bad/SKILL.md')
   })
 
   test('lists plugins first and folds only identical standalone resources', async () => {
@@ -129,7 +320,10 @@ describe('the local workflow', () => {
       ['cursor', 'plugin', 'sample'],
       ['opencode', 'instructions', 'agents'],
       ['opencode', 'skill', 'review'],
+      ['cursor', 'skill', 'review'],
     ])
+    expect(candidates[3].bundledBy).toEqual([candidates[0].id])
+    expect(candidates[2].componentConflict).toContain('sample')
   })
 
   test('previews and distributes only the npm bundle and keeps a durable runtime', async () => {
@@ -210,7 +404,8 @@ describe('the local workflow', () => {
     )
 
     const before = await service.run('overview')
-    expect(before.targets).toHaveLength(13)
+    expect(before.targets.every((t) => t.detected)).toBe(true)
+    expect(before.targets.some((t) => t.id === 'pi')).toBe(false)
     expect(before.initialized).toBe(false)
     expect(before.resources).toEqual([])
 
@@ -288,6 +483,31 @@ describe('the local workflow', () => {
       expect((await command('https://example.com')).status).toBe(403)
       expect((await command(undefined)).status).toBe(403)
       expect((await command(url, 'text/plain')).status).toBe(415)
+      for (const action of ['save-resource', 'save-scan-source']) {
+        const status = await new Promise<number | undefined>(
+          (resolve, reject) => {
+            const req = httpRequest(
+              `${url}/api/${action}`,
+              {
+                agent: false,
+                method: 'POST',
+                headers: {
+                  Origin: url,
+                  'Content-Type': 'application/json',
+                  'Content-Length': 128 * 1024 * 1024 + 1,
+                },
+              },
+              (response) => {
+                response.resume()
+                resolve(response.statusCode)
+              },
+            )
+            req.on('error', reject)
+            req.end()
+          },
+        )
+        expect(status).toBe(413)
+      }
       const invalid = await command(url, 'application/json', { body: '{' })
       expect(invalid.status).toBe(400)
       expect(invalid.headers.get('cache-control')).toBe('no-store')
@@ -366,6 +586,7 @@ describe('the local workflow', () => {
         files: { 'SKILL.md': Buffer.from(skillText).toString('base64') },
       },
     })
+    await installFixtureAgents(home, ...Object.keys(paths))
     for (const [targetId, directory] of Object.entries(paths)) {
       await writeSkill(home, directory, 'first-scan', 'Source version')
       const scan = await service.run('scan', { targetIds: [targetId] })
@@ -736,3 +957,134 @@ describe('the local workflow', () => {
     expect(await readFile(unrelated, 'utf8')).toContain('Local Skill')
   })
 })
+
+test('ignores uninstalled agents and detects returning local edits, removals and converted packages', async () => {
+  const { home, service } = await fixture()
+  await writeSkill(home, '.pi/agent/skills', 'leftover', 'uninstalled agent')
+  const local = await writeSkill(
+    home,
+    '.cursor/skills',
+    'review',
+    'current version',
+  )
+  const scan = await service.run('scan')
+  expect(scan.candidates.some((c) => c.targetId === 'pi')).toBe(false)
+  const candidate = scan.candidates.find((c) => c.resource.id === 'review')!
+  await service.run('import', { selections: [{ id: candidate.id }] })
+  await writeFile(
+    local,
+    (await readFile(local, 'utf8')).replace(
+      'current version',
+      'changed locally',
+    ),
+  )
+  expect(
+    (await service.run('scan')).candidates.find(
+      (c) => c.resource.id === 'review',
+    )?.status,
+  ).toBe('conflict')
+  await rm(local.replace(/SKILL\.md$/, ''), { recursive: true })
+  expect((await service.run('scan')).missing).toContainEqual(
+    expect.objectContaining({ targetId: 'cursor', key: 'skill:review' }),
+  )
+  await installFixtureAgents(home, 'antigravity')
+  const pkg = join(home, '.cursor/plugins/local/native')
+  await mkdir(join(pkg, '.cursor-plugin'), { recursive: true })
+  await writeFile(join(pkg, '.cursor-plugin/plugin.json'), '{"name":"native"}')
+  await writeSkill(
+    home,
+    '.cursor/plugins/local/native/skills',
+    'bundled',
+    'an original',
+  )
+  const source = (await service.run('scan')).candidates.find(
+    (c) => c.resource.id === 'native',
+  )!
+  await service.run('import', { selections: [{ id: source.id }] })
+  const options = { targetId: 'antigravity', kinds: ['plugin'] }
+  const plan = await service.run('preview-sync', options)
+  await service.run('apply-sync', { ...options, revision: plan.revision })
+  expect(
+    (await service.run('scan')).candidates.find(
+      (c) => c.targetId === 'antigravity' && c.resource.id === 'native',
+    )?.status,
+  ).toBe('same')
+  const original = (await service.run('overview')).resources.find(
+    (r) => r.id === 'native',
+  )!
+  expect(original.format).toBe('cursor')
+  expect(original.files).toHaveProperty(['.cursor-plugin/plugin.json'])
+})
+
+test.each(['skill', 'mcp', 'both', 'identical'])(
+  'compares %s components supplied solely by two local plugins',
+  async (difference) => {
+    const { home, service } = await fixture()
+    for (const name of ['docs-tools', 'review-tools']) {
+      const folder = `.cursor/plugins/local/${name}`
+      await mkdir(join(home, folder, '.cursor-plugin'), { recursive: true })
+      await writeFile(
+        join(home, folder, '.cursor-plugin/plugin.json'),
+        JSON.stringify({ name }),
+      )
+      await writeSkill(
+        home,
+        `${folder}/skills`,
+        'review',
+        difference === 'skill' || difference === 'both' ? name : 'shared',
+      )
+      const command =
+        difference === 'mcp' || difference === 'both' ? name : 'shared'
+      await writeFile(
+        join(home, folder, '.mcp.json'),
+        JSON.stringify({ mcpServers: { docs: { command } } }),
+      )
+    }
+    const { candidates } = await service.run('scan')
+    expect(candidates.map((c) => c.resource.kind)).toEqual(['plugin', 'plugin'])
+    const [first, second] = candidates
+    const both = candidates.map((c) => ({ id: c.id }))
+    if (difference === 'identical') {
+      expect(
+        candidates.every((c) => c.status === 'new' && !c.componentConflict),
+      ).toBe(true)
+      expect(suggestedLocalSelections(candidates)).toEqual(both)
+      await service.run('import', { selections: both })
+    } else {
+      for (const [item, other] of [
+        [first, second],
+        [second, first],
+      ]) {
+        expect(item.status).toBe('conflict')
+        expect(item.componentAlternatives).toEqual([other.id])
+        const expected = []
+        if (difference !== 'mcp')
+          expected.push(`${other.resource.name}（Skill「review」）`)
+        if (difference !== 'skill')
+          expected.push(`${other.resource.name}（MCP「docs」）`)
+        expect(item.componentConflict?.slice().sort()).toEqual(expected.sort())
+      }
+      expect(suggestedLocalSelections(candidates)).toEqual([])
+      const chosen = toggleLocalSelection(
+        second,
+        candidates,
+        [{ id: first.id }],
+        true,
+      )
+      expect(chosen).toEqual([{ id: second.id }])
+      await expect(service.run('import', { selections: both })).rejects.toThrow(
+        '同名组件',
+      )
+      expect((await service.run('overview')).resources).toEqual([])
+      await service.run('import', { selections: chosen })
+    }
+    const plan = await service.run('preview-sync', {
+      targetId: 'opencode',
+      kinds: ['skill', 'mcp'],
+    })
+    expect(plan.changes.map((c) => c.key).sort()).toEqual([
+      'mcp:docs',
+      'skill:review',
+    ])
+  },
+)

@@ -47,12 +47,45 @@ export type Target = {
   mcpTransports?: McpTransport[]
   instructionsPaths?: string[]
 }
-export type Candidate = { id: string; targetId: string; resource: Resource }
+export type Candidate = {
+  id: string
+  targetId: string
+  resource: Resource
+  builtin?: boolean
+  bundledBy?: string[]
+  componentConflict?: string[]
+  componentAlternatives?: string[]
+}
 export type ComparedCandidate = Candidate & {
   status: 'new' | 'same' | 'conflict'
+  contentHash: string
+  description?: string
+  conflictWithRepository?: boolean
 }
 export type Selection = { id: string; replace?: boolean }
-export type Scan = { candidates: ComparedCandidate[]; warnings: string[] }
+export type ScanIssue = {
+  builtin?: boolean
+  id: string
+  targetId: string
+  kind: ResourceKind
+  name?: string
+  description?: string
+  warning: string
+  reason: string
+  editable: boolean
+}
+export type MissingLocal = {
+  targetId: string
+  kind: ResourceKind
+  name: string
+  key: string
+}
+export type Scan = {
+  missing?: MissingLocal[]
+  candidates: ComparedCandidate[]
+  warnings: string[]
+  issues: ScanIssue[]
+}
 
 export type Scope = {
   kinds: ResourceKind[]
@@ -104,9 +137,18 @@ export type GithubStatus = GithubSource & {
   latestRevision?: string
   error?: string
 }
-export type GithubPreview = Scan & {
+export type GithubPreview = Omit<Scan, 'issues'> & {
   url: string
   revision: string
+}
+export type GithubUpdatePreview = {
+  revision: string
+  token: string
+  changes: {
+    key: string
+    action: 'add' | 'overwrite' | 'delete' | 'unlink' | 'link'
+  }[]
+  shared?: { token: string; message: string }
 }
 export type GithubSyncResult =
   | GithubSource
@@ -114,6 +156,7 @@ export type GithubSyncResult =
       conflict: { token: string; message: string }
     }
 export type Overview = {
+  workspacePath: string
   initialized: boolean
   profiles: Profile[]
   resources: Resource[]
@@ -127,6 +170,24 @@ export interface Api {
   capabilities: { request: object; response: Capabilities }
   overview: { request: object; response: Overview }
   scan: { request: { targetIds?: string[] }; response: Scan }
+  'list-scan-files': {
+    request: { id: string }
+    response: { files: string[] }
+  }
+  'read-scan-source': {
+    request: { id: string; path?: string }
+    response: {
+      name: string
+      content: string
+      revision: string
+      readOnly?: boolean
+      binary?: boolean
+    }
+  }
+  'save-scan-source': {
+    request: { id: string; path?: string; revision: string; content: string }
+    response: Scan & { updatedId?: string }
+  }
   import: {
     request: { targetIds?: string[]; selections: Selection[] }
     response: Resource[]
@@ -154,8 +215,12 @@ export interface Api {
     response: GithubSource
   }
   'check-github': { request: object; response: GithubStatus[] }
+  'preview-github-update': {
+    request: { id: string }
+    response: GithubUpdatePreview
+  }
   'sync-github': {
-    request: { id: string; replaceShared?: string }
+    request: { id: string; replaceShared?: string; token: string }
     response: GithubSyncResult
   }
 }

@@ -1,3 +1,4 @@
+import { installFixtureAgents } from '../../test/installed-fixture.js'
 import type { SyncOptions } from '../types.js'
 import {
   mkdir,
@@ -18,6 +19,7 @@ let home: string
 
 beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), 'agentweave-adapter-'))
+  await installFixtureAgents(home, 'cursor')
 })
 afterEach(async () => {
   await rm(home, { force: true, recursive: true })
@@ -160,3 +162,86 @@ it.skipIf(process.platform === 'win32')(
     ).rejects.toHaveProperty('code', 'ENOENT')
   },
 )
+
+it('mirrors bundled skills and MCPs according to what the target loads', async () => {
+  const plugin = docsPlugin()
+  const base = { home, resources: [plugin] }
+  await sync({ ...base, targetId: 'opencode', kinds: ['skill', 'mcp'] })
+  expect(
+    await readFile(
+      join(home, '.config/opencode/skills/review/SKILL.md'),
+      'utf8',
+    ),
+  ).toContain('Review documentation')
+  expect(
+    await readFile(join(home, '.config/opencode/opencode.json'), 'utf8'),
+  ).toContain('https://example.com/mcp')
+  await sync({ ...base, targetId: 'cursor', kinds: ['skill', 'mcp'] })
+  const mixed = {
+    ...base,
+    targetId: 'cursor',
+    kinds: ['plugin', 'skill', 'mcp'] as SyncOptions['kinds'],
+  }
+  const plan = await sync(mixed)
+  expect(plan.changes.map((c) => [c.action, c.kind])).toEqual(
+    expect.arrayContaining([
+      ['add', 'plugin'],
+      ['delete', 'skill'],
+      ['delete', 'mcp'],
+    ]),
+  )
+  expect((await previewSync(mixed)).changes).toEqual([])
+  expect(
+    (
+      await previewSync({
+        ...base,
+        targetId: 'cursor',
+        kinds: ['skill', 'mcp'],
+      })
+    ).changes,
+  ).toEqual([])
+})
+
+it.skipIf(process.platform === 'win32')(
+  'keeps independent copies when native plugin installation fails',
+  async () => {
+    const plugin = docsPlugin()
+    const base = { home, targetId: 'claude', resources: [plugin] }
+    await installFixtureAgents(home, 'claude')
+    await writeFile(join(home, '.local/bin/claude'), '#!/bin/sh\nexit 1\n')
+    await sync({ ...base, kinds: ['skill'] })
+    const path = join(home, '.claude/skills/review/SKILL.md'),
+      original = await readFile(path, 'utf8')
+    const options = {
+      ...base,
+      kinds: ['plugin', 'skill'] as SyncOptions['kinds'],
+    }
+    const plan = await previewSync(options)
+    expect(plan.changes).toContainEqual(
+      expect.objectContaining({ kind: 'skill', action: 'delete' }),
+    )
+    await expect(
+      applySync({ ...options, revision: plan.revision }),
+    ).rejects.toThrow()
+    expect(await readFile(path, 'utf8')).toBe(original)
+  },
+)
+
+it('allows skill distribution when the separate plugin registry is unreadable', async () => {
+  await mkdir(join(home, '.codex'), { recursive: true })
+  await writeFile(join(home, '.codex/config.toml'), '[incomplete')
+  const options: SyncOptions = {
+    home,
+    targetId: 'codex',
+    kinds: ['skill'],
+    resources: [docsPlugin()],
+  }
+  const plan = await sync(options)
+  expect(plan.warnings.join(' ')).toContain('无法核对')
+  expect(
+    await readFile(join(home, '.agents/skills/review/SKILL.md'), 'utf8'),
+  ).toContain('Review documentation')
+  expect(await readFile(join(home, '.codex/config.toml'), 'utf8')).toBe(
+    '[incomplete',
+  )
+})

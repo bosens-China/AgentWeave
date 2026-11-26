@@ -44,6 +44,7 @@ import {
 } from './shared'
 
 export function ResourcesView({
+  workspacePath,
   resources,
   firstImport,
   onAddGithub,
@@ -51,6 +52,7 @@ export function ResourcesView({
   onOpen,
   onPreview,
 }: {
+  workspacePath: string
   resources: Resource[]
   firstImport: boolean
   onAddGithub: () => void
@@ -200,6 +202,9 @@ export function ResourcesView({
           </>
         }
       />
+      <p className="text-muted text-sm wrap-anywhere">
+        可编辑目录 <code>{workspacePath}</code>
+      </p>
       <div className="resource-filters mb-6" aria-label="按资源类型筛选">
         {kindOptions.map(({ value: kind, label }) => (
           <button
