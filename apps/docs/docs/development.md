@@ -53,7 +53,7 @@ agentweave ui
 
 ## 自动发布 npm 版本
 
-GitHub Actions 会检查指向 `main` 的 PR。PR 通过审核和检查并合入受保护的 `main` 后，semantic-release 根据上一个发布标签以来的提交消息，决定是否发布新版。发布包的 `package.json`、Git 标签和 GitHub Release 使用同一个版本号。发布目标是 `agentweave-cli`。
+代码可直接推送到 `main`。GitHub Actions 检查通过后，Release Please 根据上次发布以来的提交创建或更新发布 PR。确认版本和更新日志后，合并发布 PR；合并后的检查通过时，系统创建 Git 标签和 GitHub Release，并发布 `agentweave-cli`。普通代码推送不会直接发布 npm。
 
 | 提交消息示例                                         | 版本变化                       |
 | ---------------------------------------------------- | ------------------------------ |
@@ -63,23 +63,13 @@ GitHub Actions 会检查指向 `main` 的 PR。PR 通过审核和检查并合入
 | `feat!: 调整分发接口` 或带 `BREAKING CHANGE:` 的提交 | 大版本，例如 `0.1.0 → 1.0.0`   |
 | `docs:`、`chore:` 等常规维护                         | 跳过发版                       |
 
-一次纳入多个提交时取最高的版本变化。使用 Squash Merge 时，把 PR 标题写成以上格式，并保留为最终提交的标题。
+一次纳入多个提交时取最高的版本变化。使用 Squash Merge 时，把 PR 标题写成以上格式，并保留为最终提交的标题。自动创建的发布 PR 首次运行检查可能需要仓库维护者在 PR 页面点击批准工作流。
 
-### 首次发布设置
+### 发布配置
 
-1. 将源码推到 GitHub。在 `main` 的分支保护中要求 PR 审核和 `Check` 状态检查，并约束绕过权限。
-2. 在用于首发的 `main` 提交上运行 `pnpm pack:cli`，核对安装包中的版本和文件。用有包发布权限且启用了 2FA 的 npm 账户完成首发。
-3. npm 包建立后，到包设置添加 GitHub Actions Trusted Publisher。填写真实 GitHub owner 和仓库名，Workflow filename 使用 `release.yml`，Environment name 留空，允许 `npm publish`。 [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers/)
-4. 确认 npm 上可以查到首发版本，再给用于打包的 `main` 提交打上同版本标签并推送。以首发 `0.1.0` 为例，标签为 `v0.1.0`。后续 PR 合入后自动发布。
+在 `agentweave-cli` 的 npm 设置中配置 GitHub Actions Trusted Publisher：owner 为 `bosens-China`，仓库为 `AgentWeave`，Workflow filename 为 `release.yml`，Environment name 留空，允许 `npm publish`。参见 [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers/)。GitHub 仓库还需要允许 Actions 创建 PR。
 
-首发以 `0.1.0` 为例，在审核包内容并决定发布时执行以下命令。
-
-```sh
-npm login --registry https://registry.npmjs.org/
-npm publish ./dist/agentweave-cli-0.1.0.tgz --access public --registry https://registry.npmjs.org/
-```
-
-CI 使用 GitHub OIDC 授权。发布包的仓库地址来自 `packages/cli/package.json`。如果发布任务报错，先核对相应版本是否已出现在 npm，以及 Git 标签是否已创建，再决定如何重试。
+CI 使用 GitHub OIDC 授权。如果 npm 发布任务失败，先确认该版本是否已经出现在 npm；未发布时，在对应的 Actions 运行中重新运行失败的任务。
 
 ## 编辑和预览文档
 

@@ -25,44 +25,45 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
-      - run: pnpm test:release
       - run: pnpm pack:cli
       - run: pnpm docs:build
 
-  publish:
-    name: Publish npm package
-    if: github.event_name == 'push' && github.ref_protected
+  release:
+    name: Prepare release
+    if: github.event_name == 'push'
     needs: check
     runs-on: ubuntu-latest
     concurrency:
-      group: npm-release-main
+      group: release-please-main
       cancel-in-progress: false
     permissions:
       contents: write
+      pull-requests: write
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+
+  publish:
+    name: Publish npm package
+    if: needs.release.outputs.created == 'true'
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
-      - name: Find release baseline
-        id: baseline
-        run: |
-          if git tag --merged HEAD --list 'v*' | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo 'ready=true' >> "$GITHUB_OUTPUT"
-          else
-            echo '::notice::Publish the first version and push its Git tag to enable automatic releases.'
-          fi
+          ref: ${{ needs.release.outputs.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@v6
-        if: steps.baseline.outputs.ready == 'true'
         with:
           node-version: '24'
           package-manager-cache: false
       - uses: pnpm/action-setup@v6
-        if: steps.baseline.outputs.ready == 'true'
-      - if: steps.baseline.outputs.ready == 'true'
-        run: pnpm install --frozen-lockfile
-      - name: Release
-        if: steps.baseline.outputs.ready == 'true'
-        run: pnpm exec semantic-release
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: npm publish ./packages/cli --access public

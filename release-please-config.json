@@ -1,0 +1,10 @@
+{
+  "bootstrap-sha": "fec1ed8bbe81c5cf52a4a4d5f54463b7d89fa7c0",
+  "include-component-in-tag": false,
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "extra-files": ["packages/cli/package.json"]
+    }
+  }
+}
