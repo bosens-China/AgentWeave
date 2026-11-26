@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "agentweave-example-echo": {
+      "type": "stdio",
+      "command": "agentweave-example-echo"
+    }
+  }
+}

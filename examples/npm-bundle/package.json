@@ -1,0 +1,20 @@
+{
+  "name": "agentweave-example-bundle",
+  "version": "0.1.0",
+  "description": "Example npm package that shares a Skill and an MCP server with AgentWeave",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "agentweave-example-bundle": "./bin/setup.mjs",
+    "agentweave-example-echo": "./bin/server.mjs"
+  },
+  "files": [
+    "bin",
+    "plugin.json",
+    "mcp.json",
+    "skills"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

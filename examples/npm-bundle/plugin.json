@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "agentweave-example-bundle",
+  "version": "0.1.0",
+  "description": "A Skill and a local MCP server for testing AgentWeave distribution"
+}
