@@ -51,6 +51,7 @@ export type Candidate = {
   id: string
   targetId: string
   resource: Resource
+  updatedAt?: string
   builtin?: boolean
   bundledBy?: string[]
   componentConflict?: string[]
@@ -58,9 +59,16 @@ export type Candidate = {
 }
 export type ComparedCandidate = Candidate & {
   status: 'new' | 'same' | 'conflict'
+  localChange?: 'added' | 'updated'
   contentHash: string
   description?: string
+  author?: string
+  version?: string
   conflictWithRepository?: boolean
+  mcpComparison?: {
+    fields: Record<string, string>
+    repositoryDifferences?: string[]
+  }
 }
 export type Selection = { id: string; replace?: boolean }
 export type ScanIssue = {
@@ -80,8 +88,14 @@ export type MissingLocal = {
   name: string
   key: string
 }
+export type LocalRemoval = Omit<MissingLocal, 'key'> & {
+  resourceId: string
+  key?: string
+}
 export type Scan = {
   missing?: MissingLocal[]
+  localChanges: { removed: LocalRemoval[] }
+  targets: Pick<Target, 'id' | 'name'>[]
   candidates: ComparedCandidate[]
   warnings: string[]
   issues: ScanIssue[]
@@ -137,7 +151,7 @@ export type GithubStatus = GithubSource & {
   latestRevision?: string
   error?: string
 }
-export type GithubPreview = Omit<Scan, 'issues'> & {
+export type GithubPreview = Pick<Scan, 'candidates' | 'warnings'> & {
   url: string
   revision: string
 }
@@ -155,11 +169,20 @@ export type GithubSyncResult =
   | {
       conflict: { token: string; message: string }
     }
+export type ResourceMeta = {
+  description?: string
+  author?: string
+  version?: string
+  mcpTransport?: string
+  mcpEndpoint?: string
+}
 export type Overview = {
   workspacePath: string
   initialized: boolean
   profiles: Profile[]
   resources: Resource[]
+  resourceRevisions: Record<string, string>
+  resourceMeta: Record<string, ResourceMeta>
   sources: GithubSource[]
   targets: Target[]
   drift: Drift[]
@@ -168,8 +191,8 @@ export type Overview = {
 
 export interface Api {
   capabilities: { request: object; response: Capabilities }
-  overview: { request: object; response: Overview }
-  scan: { request: { targetIds?: string[] }; response: Scan }
+  overview: { request: { checkDrift?: boolean }; response: Overview }
+  scan: { request: { targetIds?: string[]; record?: boolean }; response: Scan }
   'list-scan-files': {
     request: { id: string }
     response: { files: string[] }
@@ -193,7 +216,12 @@ export interface Api {
     response: Resource[]
   }
   'save-resource': {
-    request: { resource: Resource; replace?: boolean; fromFile?: boolean }
+    request: {
+      resource: Resource
+      replace?: boolean
+      fromFile?: boolean
+      revision?: string
+    }
     response: Resource
   }
   'create-resource': { request: NewResource; response: Resource }

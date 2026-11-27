@@ -37,24 +37,40 @@ type InventoryRecord = Pick<PluginEntry, 'path' | 'nativeId' | 'managedBy'> & {
   bundledPath?: string
 }
 
-const bundledMarket = 'openai-bundled'
+const codexBuiltinMarkets = [
+  'openai-bundled',
+  'openai-primary-runtime',
+] as const
+type CodexBuiltinMarket = (typeof codexBuiltinMarkets)[number]
+const isCodexBuiltinMarket = (market: string): market is CodexBuiltinMarket =>
+  (codexBuiltinMarkets as readonly string[]).includes(market)
 const managedReason = {
   builtin: '是平台内置插件，本次保留',
   'unverified-bundle': '的随附清单无法核实，本次保留',
   account: '由 Claude 账号同步，请在 Claude Code 中管理',
 } as const
 
-// Codex materializes its desktop marketplace under CODEX_HOME. A user marketplace
-// with the same name but a different configured source is a regular marketplace.
+// Codex materializes its bundled/runtime marketplaces under CODEX_HOME or ~/.cache/codex-runtimes.
+// A user marketplace with the same name but a different configured source is a regular marketplace.
 async function codexBundledPackages(
+  market: CodexBuiltinMarket,
   root: string,
   home: string,
   marketplaces: unknown,
 ): Promise<Map<string, string> | null> {
-  let directory = join(root, '.tmp', 'bundled-marketplaces', bundledMarket)
-  const registration = object(marketplaces)
-    ? marketplaces[bundledMarket]
-    : undefined
+  const defaultDirectory =
+    market === 'openai-primary-runtime'
+      ? join(
+          home,
+          '.cache',
+          'codex-runtimes',
+          'codex-primary-runtime',
+          'plugins',
+          market,
+        )
+      : join(root, '.tmp', 'bundled-marketplaces', market)
+  let directory = defaultDirectory
+  const registration = object(marketplaces) ? marketplaces[market] : undefined
   if (registration !== undefined) {
     if (!object(registration) || typeof registration.source !== 'string')
       return null
@@ -63,13 +79,14 @@ async function codexBundledPackages(
       !isAbsolute(registration.source)
     )
       return new Map()
-    const trusted = [directory]
+    const trusted = [
+      defaultDirectory,
+      join(root, '.tmp', 'bundled-marketplaces', market),
+    ]
     if (process.platform === 'darwin') {
       for (const parent of ['/Applications', join(home, 'Applications')]) {
         for (const app of ['ChatGPT.app', 'Codex.app'])
-          trusted.push(
-            join(parent, app, 'Contents/Resources/plugins', bundledMarket),
-          )
+          trusted.push(join(parent, app, 'Contents/Resources/plugins', market))
       }
     }
     const source = registration.source
@@ -82,7 +99,7 @@ async function codexBundledPackages(
     const catalog: unknown = JSON.parse(await readFile(catalogPath, 'utf8'))
     if (
       !object(catalog) ||
-      catalog.name !== bundledMarket ||
+      catalog.name !== market ||
       !Array.isArray(catalog.plugins)
     )
       return null
@@ -126,11 +143,23 @@ async function readInventory(target: NativeTarget) {
     const contents = await optional(readFile, join(root, 'config.toml'))
     const parsed = contents ? parseToml(contents.toString()) : {}
     const installed = object(parsed.plugins) ? parsed.plugins : {}
-    const bundled = Object.keys(installed).some((id) =>
-      id.endsWith('@' + bundledMarket),
-    )
-      ? await codexBundledPackages(root, target.home, parsed.marketplaces)
-      : new Map<string, string>()
+    const bundledByMarket = new Map<
+      CodexBuiltinMarket,
+      Map<string, string> | null
+    >()
+    for (const market of codexBuiltinMarkets) {
+      if (Object.keys(installed).some((id) => id.endsWith('@' + market))) {
+        bundledByMarket.set(
+          market,
+          await codexBundledPackages(
+            market,
+            root,
+            target.home,
+            parsed.marketplaces,
+          ),
+        )
+      }
+    }
     for (const [nativeId, data] of Object.entries(installed)) {
       try {
         const [id, market] = safeNativeId(nativeId)
@@ -147,7 +176,8 @@ async function readInventory(target: NativeTarget) {
         if (!latest) throw new Error('插件缺少本机缓存，无法读取已安装内容')
         let managedBy: InventoryRecord['managedBy']
         let bundledPath: string | undefined
-        if (market === bundledMarket) {
+        if (isCodexBuiltinMarket(market)) {
+          const bundled = bundledByMarket.get(market)
           bundledPath = bundled?.get(id)
           if (bundledPath) managedBy = 'builtin'
           else if (!bundled) managedBy = 'unverified-bundle'

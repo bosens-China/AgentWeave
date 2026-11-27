@@ -20,20 +20,31 @@
     "docs:build": "pnpm --filter @agentweave/docs run build",
     "docs:preview": "pnpm --filter @agentweave/docs run preview",
     "typecheck": "tsc --noEmit && pnpm -r run typecheck",
+    "lint": "eslint .",
     "test": "vitest run",
     "format": "prettier --write apps packages scripts docs README.md package.json pnpm-workspace.yaml tsconfig.json vitest.config.ts --ignore-path .gitignore",
     "pack:cli": "pnpm --filter agentweave-cli pack --pack-destination dist"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.0.0",
+    "eslint": "^10.15.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.8",
+    "globals": "^17.14.0",
     "lint-staged": "16.4.0",
     "prettier": "3.8.2",
     "tsx": "^4.23.15",
     "typescript": "6.0.3",
+    "typescript-eslint": "^8.74.0",
     "vitest": "5.1.1"
   },
   "lint-staged": {
-    "*.{ts,tsx,css,html,json,md}": "prettier --write"
+    "*.{js,mjs,ts,tsx}": [
+      "prettier --write",
+      "eslint --max-warnings 0"
+    ],
+    "*.{css,html,json,md}": "prettier --write"
   },
   "prettier": {
     "semi": false,

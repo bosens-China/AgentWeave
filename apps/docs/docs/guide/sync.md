@@ -15,7 +15,7 @@ agentweave sync claude skill --resource skill:review --apply
 
 ## 对齐整类资源
 
-在「同步目标」选择 Agent 和资源类别。预览列出新增、覆盖和删除，用户确认后才改动目标配置。
+打开「同步状态」，选择 Agent 和资源类别并保存范围，然后点击「同步到 {Agent}」。预览列出新增、覆盖和删除，用户确认后才改动目标配置。
 
 例如，Claude Code 的 Skills 已纳入同步，你后来又手动装了一个中央仓库里没有的 Skill。下次整类同步会把该 Skill 列为待删除项。想保留它时，可以先从本机导入中央仓库，再重新预览。
 
@@ -27,7 +27,7 @@ agentweave sync claude skill
 agentweave sync claude skill --apply
 ```
 
-保存过范围的目标会在打开网页或运行 `agentweave status` 时检查差异。多个 Agent 共用同一个位置时，预览会列出可能受影响的 Agent。
+进入「同步状态」或运行 `agentweave status` 时，会检查已保存同步范围的目标。多个 Agent 共用同一个位置时，预览会列出可能受影响的 Agent。
 
 ## 同步完整插件
 

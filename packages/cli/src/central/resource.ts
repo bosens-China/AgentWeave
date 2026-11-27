@@ -13,8 +13,11 @@ import {
   validFilePath,
   validResourceId,
 } from '../adapters/files.js'
-import { normalizeMcpConfig } from '../adapters/mcp-format.js'
-import { resourceDescription } from './resource-description.js'
+import {
+  comparableMcpConfig,
+  normalizeMcpConfig,
+} from '../adapters/mcp-format.js'
+import { resourceMetadata } from './resource-description.js'
 
 const kinds = ['skill', 'mcp', 'instructions', 'plugin']
 const formats = ['codex', 'portable', 'claude', 'cursor', 'antigravity', 'pi']
@@ -146,14 +149,17 @@ export function normalizeResource(value: unknown): Resource {
   return resource
 }
 
-function contentOf({ id, tags, components, ...value }: Resource): unknown {
-  if (value.kind === 'mcp') {
-    try {
-      value.config = normalizeMcpConfig(value.config)
-    } catch {
-      // Older repositories can contain MCP settings rejected by the current validator.
-    }
+function mcpConfigForComparison(config: Resource['config']) {
+  try {
+    return comparableMcpConfig(config)
+  } catch {
+    // Older repositories can contain MCP settings rejected by the current validator.
+    return config
   }
+}
+
+function contentOf({ id, tags, components, ...value }: Resource): unknown {
+  if (value.kind === 'mcp') value.config = mcpConfigForComparison(value.config)
   return sortedObject(
     components
       ? {
@@ -168,6 +174,14 @@ function contentOf({ id, tags, components, ...value }: Resource): unknown {
 
 export function sameContent(left: Resource, right: Resource) {
   return JSON.stringify(contentOf(left)) === JSON.stringify(contentOf(right))
+}
+
+function mcpFields(resource: Resource) {
+  return Object.fromEntries(
+    Object.entries(mcpConfigForComparison(resource.config) ?? {}).map(
+      ([field, value]) => [field, fingerprint(value)],
+    ),
+  )
 }
 
 export function matching(resources: Resource[], candidate: Resource) {
@@ -214,11 +228,33 @@ export function compared(
         )
       )
         status = 'conflict'
+      const fields =
+        candidate.resource.kind === 'mcp'
+          ? mcpFields(candidate.resource)
+          : undefined
+      const repository =
+        fields && already && status === 'conflict'
+          ? mcpFields(already)
+          : undefined
+      const meta = resourceMetadata(candidate.resource)
       return {
         ...candidate,
         status,
         contentHash: fingerprint(contentOf(candidate.resource)),
-        description: resourceDescription(candidate.resource),
+        ...meta,
+        ...(fields && {
+          mcpComparison: {
+            fields,
+            ...(repository && {
+              repositoryDifferences: [
+                ...new Set([
+                  ...Object.keys(fields),
+                  ...Object.keys(repository),
+                ]),
+              ].filter((field) => fields[field] !== repository[field]),
+            }),
+          },
+        }),
         ...(already &&
           status === 'conflict' && { conflictWithRepository: true }),
       }

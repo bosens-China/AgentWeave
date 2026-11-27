@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import { Tree } from 'antd'
 import type { TreeDataNode } from 'antd'
 
-export function buildPluginTree(files: string[]): TreeDataNode[] {
+function buildPluginTree(files: string[]): TreeDataNode[] {
   const nodes: TreeDataNode[] = []
   for (const path of files) {
     const parts = path.split('/')

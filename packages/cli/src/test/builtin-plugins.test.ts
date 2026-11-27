@@ -195,3 +195,42 @@ test('recognizes Claude builtin IDs only in actual local install records', async
   })
   expect(plan.changes.map((c) => c.key)).toEqual(['plugin:helper'])
 })
+
+test('recognizes Codex openai-primary-runtime plugins as verified builtins', async () => {
+  const runtimeMarket = join(
+    home,
+    '.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime',
+  )
+  await file(
+    join(runtimeMarket, '.agents/plugins/marketplace.json'),
+    JSON.stringify({
+      name: 'openai-primary-runtime',
+      plugins: [
+        {
+          name: 'documents',
+          source: { source: 'local', path: './plugins/documents' },
+        },
+      ],
+    }),
+  )
+  await file(
+    join(runtimeMarket, 'plugins/documents', manifest),
+    JSON.stringify({ name: 'documents', version: '26.1123.11515' }),
+  )
+  await file(
+    join(codex, 'plugins/cache/openai-primary-runtime/documents/1', manifest),
+    JSON.stringify({ name: 'documents', version: '26.1123.11515' }),
+  )
+  await file(
+    join(codex, 'config.toml'),
+    `[marketplaces.openai-primary-runtime]\nsource_type="local"\nsource=${JSON.stringify(runtimeMarket)}\n` +
+      `[plugins."documents@openai-primary-runtime"]\nenabled=true\n` +
+      `[plugins."notes@openai-curated-remote"]\nenabled=true\n`,
+  )
+  const scan = await service.run('scan', { targetIds: ['codex'] })
+  const docs = scan.candidates.find((c) => c.resource.id === 'documents')!
+  const notes = scan.candidates.find((c) => c.resource.id === 'notes')!
+  expect(docs.builtin).toBe(true)
+  expect(notes.builtin).toBeUndefined()
+  expect(suggestedLocalSelections(scan.candidates)).toEqual([{ id: notes.id }])
+})

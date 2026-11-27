@@ -79,6 +79,7 @@ export async function readSkills(
           extname(child.name) === '.md'
         ) {
           const id = checkName(basename(child.name, '.md'))
+          const fileInfo = await stat(full)
           const file = flatPayload(await readFile(full), id)
           const resource: Resource = {
             kind: 'skill',
@@ -89,6 +90,7 @@ export async function readSkills(
           entries.push({
             path: logical,
             expected: await pathState(logical),
+            updatedAt: fileInfo.mtime.toISOString(),
             flat: true,
             resource,
           })
@@ -108,6 +110,7 @@ export async function readSkills(
             entries.push({
               path: logical,
               expected: await pathState(logical),
+              updatedAt: marker.mtime.toISOString(),
               resource: { kind: 'skill', id, name, ...contents },
             })
           } else if (depth < 5 && !child.isSymbolicLink()) {

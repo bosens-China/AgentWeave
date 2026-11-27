@@ -2,7 +2,7 @@ import { agentExecutable } from './installed.js'
 import { errorMessage } from '../errors.js'
 import type { NativeTarget, PluginOperation, Tree } from './types.js'
 import { execFile } from 'node:child_process'
-import { lstat, mkdir, readdir, rm } from 'node:fs/promises'
+import { lstat, mkdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import {

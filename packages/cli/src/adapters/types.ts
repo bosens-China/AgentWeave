@@ -47,6 +47,7 @@ export type ResourceEntry = {
   path: string
   expected: string | null
   resource: Resource
+  updatedAt?: string
 }
 export type PluginEntry = ResourceEntry & {
   nativeId?: string

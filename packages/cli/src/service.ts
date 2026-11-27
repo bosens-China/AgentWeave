@@ -46,6 +46,7 @@ import { convertPlugin } from './adapters/plugins.js'
 import { convertedPiTree } from './adapters/pi-plugins.js'
 import { readMcp } from './adapters/mcp.js'
 import { patchMcpSource, previewMcpSource } from './adapters/mcp-source.js'
+import { compareLocalSnapshot, type LocalSnapshot } from './local-snapshot.js'
 
 type LocalBinding = {
   targetId: string
@@ -57,6 +58,7 @@ type LocalBinding = {
 }
 type Settings = Pick<Overview, 'initialized' | 'profiles'> & {
   bindings?: LocalBinding[]
+  localSnapshot?: LocalSnapshot
 }
 
 export class RequestError extends Error {
@@ -227,13 +229,15 @@ export function createService({
 
   async function scan(body: Record<string, unknown>, edited?: ScanSource) {
     const targetIds = stringList(body.targetIds, 'Agent', true)
-    const { candidates, warnings, issues, sources, targets } =
-      await scanTargets({
-        home,
-        targetIds,
-      })
+    const result = await scanTargets({ home, targetIds })
+    const { candidates, warnings, issues, sources, targets } = result
     const resources = await repository.list()
-    const { bindings = [] } = await readSettings()
+    const settings = await readSettings()
+    const { bindings = [], localSnapshot } = settings
+    const { snapshot, changes, removed } = compareLocalSnapshot(
+      localSnapshot,
+      result,
+    )
     const compared = compareResources(
       await inbound(candidates, resources, bindings, targets),
       resources,
@@ -262,28 +266,62 @@ export function createService({
       if (candidate.status === 'new' && candidate.componentConflict?.length)
         candidate.status = 'conflict'
       candidate.resource = raw
+      if (localSnapshot || candidate.status !== 'same')
+        candidate.localChange = changes.get(candidate.id)
     })
-    const detected = targets
     const availableKeys = new Set([
       ...resources.map(keyOf),
       ...components.map(
         ({ plugin, resource }) => keyOf(plugin) + '/' + keyOf(resource),
       ),
     ])
-    const missing = bindings
-      .filter(
+    const missingBindings = bindings.filter(
+      (b) =>
+        availableKeys.has(b.key) &&
+        targets.some((t) => t.id === b.targetId) &&
+        !issues.some((i) => i.targetId === b.targetId && i.kind === b.kind) &&
+        !candidates.some(
+          (c) =>
+            c.targetId === b.targetId &&
+            c.resource.kind === b.kind &&
+            c.resource.id === b.id,
+        ),
+    )
+    const missing = missingBindings.map(({ key, targetId, kind, name }) => ({
+      key,
+      targetId,
+      kind,
+      name,
+    }))
+    const localRemovals = removed.map((item) => {
+      const binding = bindings.find(
         (b) =>
-          availableKeys.has(b.key) &&
-          detected.some((t) => t.id === b.targetId) &&
-          !issues.some((i) => i.targetId === b.targetId && i.kind === b.kind) &&
-          !candidates.some(
-            (c) =>
-              c.targetId === b.targetId &&
-              c.resource.kind === b.kind &&
-              c.resource.id === b.id,
-          ),
+          b.targetId === item.targetId &&
+          b.kind === item.kind &&
+          b.id === item.resourceId,
       )
-      .map(({ key, targetId, kind, name }) => ({ key, targetId, kind, name }))
+      return binding && availableKeys.has(binding.key)
+        ? { ...item, key: binding.key }
+        : item
+    })
+    if (!localSnapshot)
+      localRemovals.push(
+        ...missingBindings.map(
+          ({ id: resourceId, key, targetId, kind, name }) => ({
+            resourceId,
+            key,
+            targetId,
+            kind,
+            name,
+          }),
+        ),
+      )
+
+    if (
+      body.record === true &&
+      (!localSnapshot || changes.size || removed.length)
+    )
+      await saveSettings({ ...settings, localSnapshot: snapshot })
 
     if (!targetIds) scanSources.clear()
     else {
@@ -302,6 +340,8 @@ export function createService({
     return {
       ...compared,
       missing,
+      localChanges: { removed: localRemovals },
+      targets: targets.map(({ id, name }) => ({ id, name })),
       warnings,
       issues,
       ...(updated && { updatedId: updated.id }),
@@ -470,20 +510,25 @@ export function createService({
         features: ['distribute-npm-bundle'],
       }
     },
-    async overview() {
-      const [settings, { resources, sources }, targets] = await Promise.all([
+    async overview(body) {
+      const [settings, snapshot, targets] = await Promise.all([
         readSettings(),
         repository.overview(),
         listTargets({ home }),
       ])
       const drift = await Promise.all(
-        settings.profiles
+        (body.checkDrift === false ? [] : settings.profiles)
           .filter((p) => targets.some((t) => t.id === p.targetId && t.detected))
           .map(async ({ targetId, kinds }) => {
             try {
               return {
                 targetId,
-                ...(await previewSync({ home, targetId, kinds, resources })),
+                ...(await previewSync({
+                  home,
+                  targetId,
+                  kinds,
+                  resources: snapshot.resources,
+                })),
               }
             } catch (error) {
               return {
@@ -500,14 +545,14 @@ export function createService({
         initialized: settings.initialized,
         profiles: settings.profiles,
         workspacePath: join(repositoryRoot, 'codex'),
-        resources,
-        sources,
+        ...snapshot,
         targets: targets.filter((t) => t.detected),
         drift,
         mcpProtocolBaseline: MCP_PROTOCOL_BASELINE,
       }
     },
-    scan,
+    scan: (body) =>
+      body.record === true ? mutate(() => scan(body)) : scan(body),
     'list-scan-files': async (body) => {
       const source = findScanSource(requiredString(body.id, '资源标识'))
       return {
@@ -572,9 +617,10 @@ export function createService({
         const targetIds = stringList(body.targetIds, 'Agent', true)
         const selections = selectionsOf(body.selections)
         const settings = await readSettings()
+        const scan = await scanTargets({ home, targetIds })
+        const { candidates, targets } = scan
         let result: Resource[] = []
         if (selections.length) {
-          const { candidates, targets } = await scanTargets({ home, targetIds })
           const chosen = new Set(selections.map((s) => s.id))
           if (
             candidates.some(
@@ -608,7 +654,12 @@ export function createService({
             if (stored) remember(settings, item, keyOf(stored))
           }
         }
-        await saveSettings({ ...settings, initialized: true })
+        const { snapshot } = compareLocalSnapshot(settings.localSnapshot, scan)
+        await saveSettings({
+          ...settings,
+          initialized: true,
+          localSnapshot: snapshot,
+        })
         return result
       }),
     'save-resource': (body) =>
@@ -616,6 +667,10 @@ export function createService({
         repository.save(body.resource, {
           replace: body.replace === true,
           fromFile: body.fromFile === true,
+          revision:
+            body.revision === undefined
+              ? undefined
+              : requiredString(body.revision, '资源版本'),
         }),
       ),
     'create-resource': (body) =>

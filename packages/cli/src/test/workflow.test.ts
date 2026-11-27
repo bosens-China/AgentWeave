@@ -437,6 +437,12 @@ describe('the local workflow', () => {
 
     await service.run('delete-resource', { key: 'skill:review' })
     expect(await readFile(distributed, 'utf8')).toContain('Central version')
+    const deferred = await service.run('overview', { checkDrift: false })
+    expect(deferred.profiles).toContainEqual({
+      targetId: 'claude',
+      kinds: ['skill'],
+    })
+    expect(deferred.drift).toEqual([])
     const after = await service.run('overview')
     expect(after.initialized).toBe(true)
     expect(
@@ -460,6 +466,63 @@ describe('the local workflow', () => {
       code: 'ENOENT',
     })
     expect(await readFile(original, 'utf8')).toContain('Central version')
+  })
+
+  test('按打开时的资源版本保存，拒绝过期草稿并保留仓库内容', async () => {
+    const { service } = await fixture()
+    await service.run('create-resource', {
+      kind: 'instructions',
+      id: 'rules',
+      text: '初稿',
+    })
+    const {
+      resources: [original],
+      resourceRevisions,
+    } = await service.run('overview')
+    const key = 'instructions:rules'
+    const revision = resourceRevisions[key]
+    expect(revision).toEqual(expect.any(String))
+    const latest = await service.run('save-resource', {
+      resource: { ...original, tags: ['已复核'] },
+      replace: true,
+      revision,
+    })
+    const stale = {
+      resource: { ...original, text: '另一份草稿' },
+      replace: true,
+      revision,
+    }
+    const conflict = '资源已被其他操作更新，请重新打开后再保存'
+    await expect(service.run('save-resource', stale)).rejects.toThrow(conflict)
+    const after = await service.run('overview')
+    expect(after.resources).toEqual([latest])
+    expect(after.resourceRevisions[key]).not.toBe(revision)
+    await service.run('delete-resource', { key })
+    await expect(service.run('save-resource', stale)).rejects.toThrow(conflict)
+    expect((await service.run('overview')).resources).toEqual([])
+  })
+
+  test('直接访问带尾斜杠的页面返回 SPA，静态资源和未知路径独立处理', async () => {
+    const { service, home } = await fixture()
+    const uiRoot = join(home, 'ui')
+    const index = '<!doctype html><title>AgentWeave</title>'
+    await mkdir(join(uiRoot, 'assets'), { recursive: true })
+    await writeFile(join(uiRoot, 'index.html'), index)
+    await writeFile(join(uiRoot, 'assets/app.js'), 'export {}')
+    const { server, url } = await startServer(service, { port: 0, uiRoot })
+    try {
+      for (const path of ['/resources/', '/local/', '/agents/', '/github/']) {
+        const response = await fetch(`${url}${path}`)
+        expect(response.status).toBe(200)
+        expect(await response.text()).toBe(index)
+      }
+      const asset = await fetch(`${url}/assets/app.js`)
+      expect(asset.status).toBe(200)
+      expect(await asset.text()).toBe('export {}')
+      expect((await fetch(`${url}/nope/`)).status).toBe(404)
+    } finally {
+      await new Promise((done) => server.close(done))
+    }
   })
 
   test('serves the JSON API only for local UI requests', async () => {
@@ -956,6 +1019,137 @@ describe('the local workflow', () => {
     ).toBe(skill)
     expect(await readFile(unrelated, 'utf8')).toContain('Local Skill')
   })
+})
+
+test('records installed agents across openings and remembers unselected items after import', async () => {
+  const { home, service } = await fixture()
+  const root = join(home, 'AgentWeave')
+  const selected = await writeSkill(
+    home,
+    '.cursor/skills',
+    'selected',
+    'Original',
+  )
+  const unselected = await writeSkill(
+    home,
+    '.cursor/skills',
+    'unselected',
+    'Unselected',
+  )
+  await writeSkill(home, '.pi/agent/skills', 'leftover', 'Uninstalled')
+  const open = await service.run('scan', { record: true })
+  expect(open.targets?.some(({ id }) => id === 'pi')).toBe(false)
+  expect(
+    open.candidates.map(({ resource, localChange }) => [
+      resource.id,
+      localChange,
+    ]),
+  ).toEqual([
+    ['selected', 'added'],
+    ['unselected', 'added'],
+  ])
+
+  const reopened = createService({ home, root })
+  expect((await reopened.run('overview')).initialized).toBe(false)
+  expect(
+    (await reopened.run('scan', { record: true })).candidates.every(
+      ({ localChange }) => !localChange,
+    ),
+  ).toBe(true)
+
+  await writeSkill(home, '.cursor/skills', 'selected', 'Changed while open')
+  const beforeImport = await reopened.run('scan')
+  expect(
+    beforeImport.candidates.find(({ resource }) => resource.id === 'selected')
+      ?.localChange,
+  ).toBe('updated')
+  const extra = await writeSkill(
+    home,
+    '.cursor/skills',
+    'extra',
+    'Also present at import',
+  )
+  const choice = beforeImport.candidates.find(
+    ({ resource }) => resource.id === 'selected',
+  )!
+  await expect(
+    reopened.run('import', { selections: [{ id: 'stale' }] }),
+  ).rejects.toThrow('重新扫描')
+  expect(
+    (await reopened.run('scan')).candidates.find(
+      ({ resource }) => resource.id === 'extra',
+    )?.localChange,
+  ).toBe('added')
+  await reopened.run('import', { selections: [{ id: choice.id }] })
+  expect(
+    (await reopened.run('overview')).resources.map(({ id }) => id),
+  ).toEqual(['selected'])
+  const afterImport = await reopened.run('scan', { record: true })
+  expect(afterImport.candidates.every(({ localChange }) => !localChange)).toBe(
+    true,
+  )
+  expect(
+    afterImport.candidates.find(({ resource }) => resource.id === 'extra')
+      ?.status,
+  ).toBe('new')
+
+  await writeFile(unselected, 'Malformed skill')
+  const invalid = await reopened.run('scan', { record: true })
+  expect(
+    invalid.issues.some(
+      ({ targetId, kind }) => targetId === 'cursor' && kind === 'skill',
+    ),
+  ).toBe(true)
+  expect(invalid.localChanges?.removed).toEqual([])
+  await rm(unselected)
+  await rm(extra)
+  await rm(selected)
+  const deleted = await reopened.run('scan', { record: true })
+  expect(deleted.localChanges?.removed).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        resourceId: 'selected',
+        key: 'skill:selected',
+      }),
+      {
+        targetId: 'cursor',
+        kind: 'skill',
+        resourceId: 'unselected',
+        name: 'unselected',
+      },
+      { targetId: 'cursor', kind: 'skill', resourceId: 'extra', name: 'extra' },
+    ]),
+  )
+  expect(
+    (await reopened.run('scan', { record: true })).localChanges?.removed,
+  ).toEqual([])
+})
+
+test('keeps the snapshots of other and temporarily unavailable agents', async () => {
+  const { home, service } = await fixture()
+  await writeSkill(home, '.cursor/skills', 'cursor-item', 'Original')
+  await writeSkill(home, '.claude/skills', 'claude-item', 'Original')
+  await service.run('scan', { record: true })
+  await writeSkill(home, '.claude/skills', 'claude-item', 'Edited')
+  await service.run('scan', { record: true, targetIds: ['cursor'] })
+  const executable = process.platform === 'win32' ? 'cursor.cmd' : 'cursor'
+  await rm(join(home, '.local/bin', executable))
+  const withoutCursor = await service.run('scan', { record: true })
+  expect(withoutCursor.localChanges?.removed).toEqual([])
+  expect(
+    withoutCursor.candidates.find(
+      ({ resource }) => resource.id === 'claude-item',
+    )?.localChange,
+  ).toBe('updated')
+  expect(
+    withoutCursor.candidates.some(({ targetId }) => targetId === 'cursor'),
+  ).toBe(false)
+  await installFixtureAgents(home, 'cursor')
+  const withCursor = await service.run('scan', { record: true })
+  expect(
+    withCursor.candidates.find(({ resource }) => resource.id === 'cursor-item')
+      ?.localChange,
+  ).toBeUndefined()
 })
 
 test('ignores uninstalled agents and detects returning local edits, removals and converted packages', async () => {

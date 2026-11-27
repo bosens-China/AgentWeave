@@ -91,7 +91,8 @@ export async function scanTargets({
         resource,
         path,
         managedBy,
-      }: Pick<PluginEntry, 'resource' | 'path' | 'managedBy'>) {
+        updatedAt,
+      }: Pick<PluginEntry, 'resource' | 'path' | 'managedBy' | 'updatedAt'>) {
         const builtin = managedBy === 'builtin'
         const id = fingerprint(
           builtin
@@ -116,6 +117,7 @@ export async function scanTargets({
           candidates.push({
             id,
             targetId: target.id,
+            ...(updatedAt && { updatedAt }),
             ...(builtin && { builtin: true }),
             resource: {
               ...checked,

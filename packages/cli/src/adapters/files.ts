@@ -20,7 +20,6 @@ import {
   join,
   parse,
   relative,
-  resolve,
   sep,
 } from 'node:path'
 import lockfile from 'proper-lockfile'

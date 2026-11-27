@@ -21,21 +21,27 @@ const help = `AgentWeave
   agentweave ui [--no-open]             打开本地网页
   agentweave capabilities --json        查询 CLI 兼容版本和接入能力
   agentweave distribute --from DIR --target AGENT [--apply]
-  agentweave init                       扫描并选择导入资源
-  agentweave scan [AGENT ...]            查看可导入资源和导入标识
+  agentweave init [--skip]              扫描并选择导入资源（--skip 跳过首次导入）
+  agentweave scan [AGENT ...]            查看可导入资源、异常项与已移除项
+  agentweave source files ID             查看扫描到的插件文件列表
+  agentweave source read ID [--path FILE]
+  agentweave source save ID --file FILE [--path FILE] [--revision REV] [--yes]
   agentweave import ID ...               导入指定资源（--replace ID 可显式覆盖）
   agentweave list                       列出中央资源
-  agentweave create skill ID --description TEXT --file FILE
-  agentweave create mcp ID --command PROGRAM [--arg ARG ...]
-  agentweave create mcp ID --url URL [--transport streamable-http|sse]
-  agentweave create instructions ID --file FILE
+  agentweave show KIND:ID [--file FILE] 查看中央资源详情（--json 可导出完整 JSON）
+  agentweave create skill ID --description TEXT --file FILE [--tag TAG ...]
+  agentweave create mcp ID --command PROGRAM [--arg ARG ...] [--env KEY=VALUE ...] [--tag TAG ...]
+  agentweave create mcp ID --url URL [--transport streamable-http|sse] [--header KEY=VALUE ...] [--tag TAG ...]
+  agentweave create instructions ID --file FILE [--tag TAG ...]
   agentweave save FILE [--overwrite]     从 JSON 文件保存资源
   agentweave remove KIND:ID              删除中央资源
   agentweave targets [AGENT]             查看 Agent 和支持的类型
-  agentweave profile AGENT [KIND ...]     设置启动时检查的类型（省略类型则清除）
+  agentweave profile [AGENT [KIND ...]]  查看或设置启动时检查的类型（省略类型则清除）
   agentweave sync AGENT KIND ...         预览类别同步（--resource KIND:ID 指定单项）
   agentweave sync AGENT KIND --apply     应用预览，确认后再改动目标
-  agentweave github add URL              把 GitHub 资源加入中央仓库
+  agentweave github list                 列出已添加的 GitHub 来源
+  agentweave github preview URL          预览 GitHub 来源中的可导入资源
+  agentweave github add URL [ID ...]     把 GitHub 资源加入中央仓库（--replace ID 覆盖冲突）
   agentweave github check                检查已添加的 GitHub 来源
   agentweave github sync SOURCE_ID [--yes] [--replace-shared]
   agentweave status                      查看启动检查结果
@@ -53,6 +59,7 @@ const { values, positionals } = parseArgs({
     json: { type: 'boolean' },
     yes: { type: 'boolean', short: 'y' },
     apply: { type: 'boolean' },
+    skip: { type: 'boolean' },
     resource: { type: 'string', multiple: true },
     replace: { type: 'string', multiple: true },
     'replace-shared': { type: 'boolean' },
@@ -62,14 +69,43 @@ const { values, positionals } = parseArgs({
     overwrite: { type: 'boolean' },
     description: { type: 'string' },
     file: { type: 'string' },
+    path: { type: 'string' },
     command: { type: 'string' },
     arg: { type: 'string', multiple: true },
+    tag: { type: 'string', multiple: true },
+    env: { type: 'string', multiple: true },
+    header: { type: 'string', multiple: true },
     url: { type: 'string' },
     transport: { type: 'string' },
     'no-open': { type: 'boolean' },
     dev: { type: 'boolean' },
   },
 })
+
+function parseKeyValuePairs(
+  entries: string[] | undefined,
+  option: string,
+): Record<string, string> | undefined {
+  if (!entries?.length) return undefined
+  const record: Record<string, string> = {}
+  for (const entry of entries) {
+    const separator = entry.indexOf('=')
+    if (separator <= 0)
+      throw new Error(`${option} 选项格式应为 KEY=VALUE，收到：${entry}`)
+    record[entry.slice(0, separator)] = entry.slice(separator + 1)
+  }
+  return record
+}
+
+function decodeResourceFile(encoded: string) {
+  const bytes = Buffer.from(encoded, 'base64')
+  if (bytes.includes(0)) return null
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  } catch {
+    return null
+  }
+}
 
 function print(value: unknown): void {
   if (values.json) console.log(JSON.stringify(value, null, 2))
@@ -204,9 +240,14 @@ async function main() {
     !command ||
     command === 'status' ||
     command === 'list' ||
+    command === 'show' ||
     command === 'targets'
   ) {
     const overview = await run('overview')
+    if (command === 'init' && values.skip) {
+      const imported = await run('import', { selections: [] })
+      return print(values.json ? imported : '已跳过首次导入。')
+    }
     if (
       command === 'init' ||
       (!command &&
@@ -233,8 +274,49 @@ async function main() {
       return print(
         values.json
           ? rows
-          : rows.map(({ kind, id, name }) => `${kind}:${id}  ${name}`),
+          : rows.map(
+              ({ kind, id, name, tags }) =>
+                `${kind}:${id}  ${name}${tags?.length ? `  [${tags.join(', ')}]` : ''}`,
+            ),
       )
+    }
+    if (command === 'show') {
+      const key = args[0]
+      if (!key) throw new Error('请提供资源标识（如 skill:review）。')
+      const resource = overview.resources.find(
+        (item) => `${item.kind}:${item.id}` === key,
+      )
+      if (!resource) throw new Error(`未找到中央资源 ${key}。`)
+      if (values.file) {
+        if (!resource.files || !Object.hasOwn(resource.files, values.file))
+          throw new Error(`资源 ${key} 不包含文件 ${values.file}。`)
+        const decoded = decodeResourceFile(resource.files[values.file])
+        if (values.json)
+          return print({
+            path: values.file,
+            binary: decoded === null,
+            content: decoded,
+          })
+        return print(decoded ?? '此文件为二进制内容，无法以文本查看。')
+      }
+      if (values.json) return print(resource)
+      const lines = [`${resource.kind}:${resource.id}  ${resource.name}`]
+      if (resource.tags?.length) lines.push(`标签  ${resource.tags.join('、')}`)
+      if (resource.format) lines.push(`格式  ${resource.format}`)
+      if (resource.components?.length) {
+        for (const component of resource.components)
+          lines.push(
+            `组件  ${resource.kind}:${resource.id}/${component.kind}:${component.id}  ${component.name}`,
+          )
+      }
+      if (resource.files) {
+        for (const filePath of Object.keys(resource.files).sort())
+          lines.push(`文件  ${filePath}`)
+      }
+      if (resource.text !== undefined) lines.push('', resource.text)
+      if (resource.config !== undefined)
+        lines.push('', JSON.stringify(resource.config, null, 2))
+      return print(lines)
     }
     if (command === 'targets') {
       if (args[0]) {
@@ -294,14 +376,18 @@ async function main() {
         github,
       })
     print(
-      `本机新增 ${added} 项，冲突 ${conflicts} 项，已移除 ${local.missing?.length ?? 0} 项。运行 agentweave ui 可选择导入或恢复。`,
+      `本机新增 ${added} 项，冲突 ${conflicts} 项，需处理 ${local.issues.length} 项，已移除 ${local.missing?.length ?? 0} 项。`,
     )
+    for (const item of local.missing ?? [])
+      print(
+        `已移除  ${item.targetId}  ${item.name}（恢复：agentweave sync ${item.targetId} ${item.kind} --resource ${item.key} --apply）`,
+      )
     for (const source of github.filter((s) => s.status !== 'current'))
       print(
         `GitHub ${source.url}  ${source.status === 'update' ? '有更新' : source.error}`,
       )
     print(
-      `中央仓库 ${overview.resources.length} 项资源，已检测到 ${overview.targets.filter(({ detected }) => detected).length} 个 Agent。`,
+      `中央仓库 ${overview.resources.length} 项资源（${overview.workspacePath}），已检测到 ${overview.targets.filter(({ detected }) => detected).length} 个 Agent。`,
     )
     if (!overview.initialized)
       print('运行 agentweave init 或 agentweave ui 开始首次设置。')
@@ -323,7 +409,60 @@ async function main() {
         ({ id, status, targetId, resource, componentConflict, builtin }) =>
           `${id}  ${targetId}  ${resource.name}  ${status}${builtin ? '  内置' : ''}${componentConflict?.length ? `  组件版本不同：${componentConflict.join('、')}` : ''}`,
       ),
+      ...result.issues.map(
+        ({ id, targetId, kind, name, reason, editable, builtin }) =>
+          `需处理  ${id}  ${targetId}  ${name ?? kind}  ${reason}${builtin ? '  内置' : ''}${editable ? '  可编辑' : ''}`,
+      ),
+      ...(result.missing ?? []).map(
+        ({ targetId, kind, key, name }) =>
+          `已移除  ${targetId}  ${kind}  ${key}  ${name}`,
+      ),
     ])
+  }
+  if (command === 'source' && args[0] === 'files') {
+    if (!args[1]) throw new Error('请提供扫描资源标识。')
+    await run('scan')
+    const result = await run('list-scan-files', { id: args[1] })
+    return print(values.json ? result : result.files)
+  }
+  if (command === 'source' && args[0] === 'read') {
+    if (!args[1]) throw new Error('请提供扫描资源标识。')
+    await run('scan')
+    const result = await run('read-scan-source', {
+      id: args[1],
+      path: values.path,
+    })
+    if (values.json) return print(result)
+    return print(
+      result.binary ? '此文件为二进制内容，无法以文本查看。' : result.content,
+    )
+  }
+  if (command === 'source' && args[0] === 'save') {
+    if (!args[1]) throw new Error('请提供扫描资源标识。')
+    if (!values.file) throw new Error('请使用 --file 指定要写入的内容文件。')
+    const content = utf8Text(await readFile(values.file))
+    await run('scan')
+    const current = await run('read-scan-source', {
+      id: args[1],
+      path: values.path,
+    })
+    if (values.revision && values.revision !== current.revision)
+      throw new Error('文件已被修改，请重新读取后再保存。')
+    if (!(await confirm(`保存修改到 ${current.name}（Agent 原始文件）？`)))
+      return
+    const result = await run('save-scan-source', {
+      id: args[1],
+      path: values.path,
+      revision: current.revision,
+      content,
+    })
+    return print(
+      values.json
+        ? result
+        : result.updatedId
+          ? `已保存修改到 ${current.name}，新导入标识：${result.updatedId}`
+          : `已保存修改到 ${current.name}。`,
+    )
   }
   if (command === 'import') {
     const replacements = new Set(values.replace || [])
@@ -342,9 +481,12 @@ async function main() {
       throw new Error(
         '用法为 agentweave create skill|mcp|instructions ID，请查看 --help。',
       )
+    const env = parseKeyValuePairs(values.env, '--env')
+    const headers = parseKeyValuePairs(values.header, '--header')
     const result = await run('create-resource', {
       kind,
       id,
+      tags: values.tag,
       description: values.description,
       text:
         values.file && kind !== 'mcp'
@@ -353,7 +495,9 @@ async function main() {
       transport: values.transport ?? (values.url ? 'streamable-http' : 'stdio'),
       command: values.command,
       args: values.arg,
+      env,
       url: values.url,
+      headers,
     })
     return print(values.json ? result : `已创建 ${result.kind}:${result.id}。`)
   }
@@ -382,6 +526,17 @@ async function main() {
     return print(values.json ? { removed: true } : '已从中央仓库删除。')
   }
   if (command === 'profile') {
+    if (!args[0]) {
+      const { profiles } = await run('overview')
+      if (values.json) return print(profiles)
+      return print(
+        profiles.length
+          ? profiles.map(
+              ({ targetId, kinds }) => `${targetId}  ${kinds.join('、')}`,
+            )
+          : '当前未设置启动检查范围。',
+      )
+    }
     const result = await run('set-profile', {
       targetId: args[0],
       kinds: args.slice(1),
@@ -440,7 +595,47 @@ async function main() {
     })
     return print(values.json ? result : '已导入并分发 npm 包资源。')
   }
+  if (command === 'github' && args[0] === 'list') {
+    const { sources } = await run('overview')
+    if (values.json) return print(sources)
+    return print(
+      sources.length
+        ? sources.map(
+            ({ id, url, revision, keys }) =>
+              `${id}  ${url}  ${revision.slice(0, 8)}  ${keys.length} 项资源`,
+          )
+        : '还没有添加 GitHub 来源。',
+    )
+  }
+  if (command === 'github' && args[0] === 'preview') {
+    const preview = await run('preview-github', { url: args[1] })
+    if (values.json) return print(preview)
+    return print([
+      `版本  ${preview.revision.slice(0, 8)}`,
+      ...preview.warnings.map((warning) => `提示  ${warning}`),
+      ...preview.candidates.map(
+        ({ id, status, resource }) =>
+          `${id}  ${resource.kind}  ${resource.name}  ${status}`,
+      ),
+    ])
+  }
   if (command === 'github' && args[0] === 'add') {
+    const explicitIds = args.slice(2)
+    const replacements = new Set(values.replace || [])
+    if (explicitIds.length || replacements.size) {
+      const selections = [...new Set([...explicitIds, ...replacements])].map(
+        (id) => ({
+          id,
+          replace: replacements.has(id),
+        }),
+      )
+      const result = await run('add-github', {
+        url: args[1],
+        revision: values.revision,
+        selections,
+      })
+      return print(values.json ? result : `已添加 GitHub 来源 ${result.id}。`)
+    }
     const { url, revision, candidates, warnings } = await run(
       'preview-github',
       {
@@ -471,8 +666,13 @@ async function main() {
     const source = { id: args[1] }
     const preview = await run('preview-github-update', source)
     if (!values.json) {
-      for (const change of preview.changes)
-        print(`${change.action}  ${change.key}`)
+      print(`版本  ${preview.revision.slice(0, 8)}`)
+      if (preview.changes.length) {
+        for (const change of preview.changes)
+          print(`${change.action}  ${change.key}`)
+      } else {
+        print('仅更新来源版本记录')
+      }
       if (preview.shared) print(preview.shared.message)
     }
     if (

@@ -16,8 +16,9 @@ const hostname = '127.0.0.1'
 const devUiUrl = `http://${hostname}:5173`
 const maxBodyBytes = 32 * 1024 * 1024
 const maxSaveBodyBytes = 128 * 1024 * 1024
-const uiRoot = fileURLToPath(new URL('../dist/ui', import.meta.url))
+const defaultUiRoot = fileURLToPath(new URL('../dist/ui', import.meta.url))
 const uiExtensions = new Set(['.html', '.js', '.css', '.svg', '.png', '.woff2'])
+const spaRoutes = new Set(['/', '/local', '/resources', '/agents', '/github'])
 const securityHeaders = {
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
@@ -62,7 +63,7 @@ async function readJson(c: ServerContext, limit: number): Promise<unknown> {
 
 export async function startServer(
   service: { run: (action: string, body: unknown) => Promise<unknown> },
-  { port = 10107, dev = false } = {},
+  { port = 10107, dev = false, uiRoot = defaultUiRoot } = {},
 ) {
   const app = new Hono<ServerEnv>()
 
@@ -123,10 +124,17 @@ export async function startServer(
   })
 
   const serveUi = dev ? undefined : serveStatic({ root: uiRoot })
+  const serveIndex = dev
+    ? undefined
+    : serveStatic({ root: uiRoot, path: 'index.html' })
   app.get('*', async (c) => {
-    const pathname = c.req.path
-    if (dev && pathname === '/') return c.redirect(devUiUrl)
-    if (!serveUi || (pathname !== '/' && !uiExtensions.has(extname(pathname))))
+    const pathname = c.req.path.replace(/\/+$/, '') || '/'
+    const isSpa = spaRoutes.has(pathname)
+    if (dev && isSpa) {
+      const { search } = new URL(c.req.url)
+      return c.redirect(`${devUiUrl}${pathname}${search}`)
+    }
+    if (!serveUi || (!isSpa && !uiExtensions.has(extname(pathname))))
       throw new RequestError('页面不存在。', 404)
     c.header(
       'Cache-Control',
@@ -134,8 +142,9 @@ export async function startServer(
         ? 'public, max-age=31536000, immutable'
         : 'no-cache',
     )
-    const response = await serveUi(c, async () => {
-      if (pathname === '/')
+    const handler = isSpa ? serveIndex! : serveUi
+    const response = await handler(c, async () => {
+      if (isSpa)
         throw new RequestError(
           '未找到 UI 构建产物，请先运行 npm run build。',
           503,

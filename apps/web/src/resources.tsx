@@ -1,27 +1,15 @@
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import {
   Alert,
   App,
   Button,
   Drawer,
-  Dropdown,
-  Empty,
   Form,
   Input,
   Popconfirm,
   Select,
-  Table,
-  Tag,
 } from 'antd'
-import {
-  ArrowRightOutlined,
-  CloudDownloadOutlined,
-  GithubOutlined,
-  PlusOutlined,
-  SearchOutlined,
-  SyncOutlined,
-} from '@ant-design/icons'
-import type { TableProps } from 'antd'
+import { SyncOutlined } from '@ant-design/icons'
 import type {
   McpTransport,
   NewResource,
@@ -35,247 +23,8 @@ import {
   request,
   resourceKey,
 } from './api'
-import {
-  KindIcon,
-  KindTag,
-  kindOptions,
-  PageTitle,
-  resourceKinds,
-} from './shared'
-
-export function ResourcesView({
-  workspacePath,
-  resources,
-  firstImport,
-  onAddGithub,
-  onScan,
-  onOpen,
-  onPreview,
-}: {
-  workspacePath: string
-  resources: Resource[]
-  firstImport: boolean
-  onAddGithub: () => void
-  onScan: () => void
-  onOpen: (resource: Resource | null, kind?: ResourceKind) => void
-  onPreview: (resource: Resource) => void
-}) {
-  const [selectedKind, setSelectedKind] = useState<ResourceKind | ''>('')
-  const [query, setQuery] = useState('')
-  const counts = useMemo(() => {
-    const result: Partial<Record<ResourceKind, number>> = {}
-    for (const { kind } of resources) result[kind] = (result[kind] ?? 0) + 1
-    return result
-  }, [resources])
-
-  const visible = resources.filter((resource) => {
-    return (
-      (!selectedKind || selectedKind === resource.kind) &&
-      [resource.name, resource.id, ...(resource.tags ?? [])].some((value) => {
-        return value.toLowerCase().includes(query.trim().toLowerCase())
-      })
-    )
-  })
-
-  const columns: TableProps<Resource>['columns'] = [
-    {
-      title: '资源名称',
-      render: (_, resource) => (
-        <button
-          className="resource-name"
-          type="button"
-          onClick={() => onOpen(resource)}
-        >
-          <KindIcon kind={resource.kind} />
-          <span className="min-w-0">
-            <strong className="wrap-anywhere">{resource.name}</strong>
-            {resource.name !== resource.id && (
-              <span className="block text-muted text-xs wrap-anywhere">
-                {resource.id}
-              </span>
-            )}
-          </span>
-        </button>
-      ),
-    },
-    {
-      title: '类型',
-      dataIndex: 'kind',
-      width: 104,
-      render: (kind: ResourceKind) => <KindTag kind={kind} />,
-    },
-    {
-      title: '标签',
-      responsive: ['md'],
-      render: (_, resource) =>
-        resource.tags?.length ? (
-          <div className="flex gap-1 flex-wrap">
-            {resource.tags.map((tag) => (
-              <Tag key={tag}>{tag}</Tag>
-            ))}
-          </div>
-        ) : (
-          <span className="text-muted">—</span>
-        ),
-    },
-    {
-      title: '操作',
-      width: 132,
-      align: 'right',
-      responsive: ['sm'],
-      render: (_, resource) => (
-        <div className="flex items-center justify-end gap-1 flex-wrap">
-          <Button
-            type="text"
-            size="small"
-            icon={<SyncOutlined />}
-            onClick={() => onPreview(resource)}
-          >
-            分发
-          </Button>
-          <Button
-            type="text"
-            size="small"
-            icon={<ArrowRightOutlined />}
-            aria-label={`查看 ${resource.name}`}
-            onClick={() => onOpen(resource)}
-          />
-        </div>
-      ),
-    },
-    {
-      title: '操作',
-      width: 84,
-      align: 'right',
-      responsive: ['xs'],
-      render: (_, resource) => (
-        <Button type="text" size="small" onClick={() => onPreview(resource)}>
-          分发
-        </Button>
-      ),
-    },
-  ]
-
-  return (
-    <>
-      <PageTitle
-        title="中央仓库"
-        description="管理本机的 Skills、MCP、全局指令和插件，并分发到需要的 Agent。"
-        actions={
-          <>
-            {!firstImport && (
-              <Button icon={<CloudDownloadOutlined />} onClick={onScan}>
-                扫描本机
-              </Button>
-            )}
-            <Dropdown
-              menu={{
-                items: [
-                  {
-                    key: 'github',
-                    label: '从 GitHub 添加',
-                    icon: <GithubOutlined />,
-                    onClick: onAddGithub,
-                  },
-                  {
-                    key: 'skill',
-                    label: '新建 Skill',
-                    onClick: () => onOpen(null, 'skill'),
-                  },
-                  {
-                    key: 'mcp',
-                    label: '新建 MCP',
-                    onClick: () => onOpen(null, 'mcp'),
-                  },
-                  {
-                    key: 'instructions',
-                    label: '新建全局指令',
-                    onClick: () => onOpen(null, 'instructions'),
-                  },
-                ],
-              }}
-            >
-              <Button type="primary" icon={<PlusOutlined />}>
-                添加资源
-              </Button>
-            </Dropdown>
-          </>
-        }
-      />
-      <p className="text-muted text-sm wrap-anywhere">
-        可编辑目录 <code>{workspacePath}</code>
-      </p>
-      <div className="resource-filters mb-6" aria-label="按资源类型筛选">
-        {kindOptions.map(({ value: kind, label }) => (
-          <button
-            key={kind}
-            type="button"
-            aria-pressed={selectedKind === kind}
-            className={`metric-card ${selectedKind === kind ? 'metric-card-active' : ''}`}
-            onClick={() => setSelectedKind(selectedKind === kind ? '' : kind)}
-          >
-            <KindIcon kind={kind} />
-            <span className="text-left">
-              <span className="block text-sm text-muted">{label}</span>
-              <strong className="metric-count">{counts[kind] ?? 0}</strong>
-            </span>
-          </button>
-        ))}
-      </div>
-      <section className="surface overflow-hidden">
-        <header className="table-header">
-          <div>
-            <h2>
-              {selectedKind ? resourceKinds[selectedKind].label : '全部资源'}
-            </h2>
-            <span className="text-sm text-muted">{visible.length} 项</span>
-          </div>
-          <Input
-            prefix={<SearchOutlined />}
-            className="resource-search"
-            aria-label="搜索资源"
-            placeholder="搜索名称或标签"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            allowClear
-          />
-        </header>
-        <Table
-          columns={columns}
-          dataSource={visible}
-          rowKey={resourceKey}
-          pagination={
-            visible.length > 10
-              ? { pageSize: 10, showSizeChanger: false }
-              : false
-          }
-          locale={{
-            emptyText: (
-              <Empty
-                className="py-8"
-                image={Empty.PRESENTED_IMAGE_SIMPLE}
-                description={
-                  resources.length ? '没有匹配的资源' : '中央仓库还没有资源'
-                }
-              >
-                {resources.length ? (
-                  <Button
-                    onClick={() => {
-                      setSelectedKind('')
-                      setQuery('')
-                    }}
-                  >
-                    清除筛选
-                  </Button>
-                ) : null}
-              </Empty>
-            ),
-          }}
-        />
-      </section>
-    </>
-  )
-}
+import { KindIcon } from './shared'
+import { resourceKinds } from './shared-helpers'
 
 function fileEntries(resource: Resource | null) {
   return Object.entries(resource?.files ?? {}).sort(([first], [second]) => {
@@ -348,12 +97,14 @@ function newResourceInput(
 export function ResourceDrawer({
   resource,
   kind,
+  revision,
   onClose,
   onChanged,
   onPreview,
 }: {
   resource: Resource | null
   kind: ResourceKind
+  revision?: string
   onClose: () => void
   onChanged: () => void | Promise<void>
   onPreview: (resource: Resource, plugin?: Resource) => void
@@ -387,13 +138,19 @@ export function ResourceDrawer({
         if (kind === 'instructions') updated.text = text
         if (kind === 'mcp') updated.config = parseConfig(text)
         if (kind === 'skill') updated.files = files
-        await request('save-resource', { resource: updated, replace: true })
+        await request('save-resource', {
+          resource: updated,
+          replace: true,
+          revision,
+        })
       }
       message.success('已保存到中央仓库')
       onClose()
       await onChanged()
     } catch (error) {
       message.error(errorMessage(error))
+      // 刷新列表供重新打开时使用，抽屉保留当前草稿和打开时的版本。
+      if (resource) await onChanged()
     } finally {
       setSaving(false)
     }
@@ -422,13 +179,18 @@ export function ResourceDrawer({
       closable={!saving && !removing}
       mask={{ closable: !saving && !removing }}
       keyboard={!saving && !removing}
-      title={resource ? resource.name : `新建${resourceKinds[kind].name}`}
+      title={
+        resource?.name ??
+        (kind === 'instructions'
+          ? '新建全局指令'
+          : `新建 ${resourceKinds[kind].name}`)
+      }
       footer={
         <div className="flex gap-2 justify-between items-center flex-wrap">
           <div>
             {resource && (
               <Popconfirm
-                title="删除中央仓库里的这份资源？"
+                title="从中央仓库删除此资源？"
                 description="下次同步时可预览需要清理的 Agent 副本。"
                 okText="删除"
                 cancelText="取消"
@@ -462,7 +224,7 @@ export function ResourceDrawer({
         </div>
       }
     >
-      <div className="flex flex-col gap-5">
+      <div className="flex flex-col gap-0">
         <Form
           form={form}
           name="resource"
@@ -605,21 +367,20 @@ export function ResourceDrawer({
           )}
         </Form>
         {selectedFile && (
-          <div className="flex flex-col gap-2">
-            <label className="field-label" htmlFor="resource-file">
-              文件
-            </label>
-            <Select
-              id="resource-file"
-              value={selectedFile}
-              options={fileEntries(resource).map(([path]) => ({
-                label: path,
-                value: path,
-              }))}
-              onChange={setSelectedFile}
-            />
+          <Form layout="vertical" component="div">
+            <Form.Item label="文件" htmlFor="resource-file">
+              <Select
+                id="resource-file"
+                value={selectedFile}
+                options={fileEntries(resource).map(([path]) => ({
+                  label: path,
+                  value: path,
+                }))}
+                onChange={setSelectedFile}
+              />
+            </Form.Item>
             {selectedText === null ? (
-              <Alert type="info" title="此文件为二进制内容" />
+              <Alert type="info" title="此文件为二进制格式" />
             ) : (
               <Input.TextArea
                 aria-label={selectedFile}
@@ -636,11 +397,11 @@ export function ResourceDrawer({
                 spellCheck={false}
               />
             )}
-          </div>
+          </Form>
         )}
         {!!resource?.components?.length && (
           <div>
-            <h3>插件资源</h3>
+            <h3 className="m-0 mb-2 text-base font-semibold">插件资源</h3>
             <div className="selection-list">
               {resource.components.map((component) => (
                 <div className="selection-row" key={resourceKey(component)}>

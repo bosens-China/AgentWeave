@@ -8,46 +8,43 @@ import type {
   Selection,
   Target,
 } from '@agentweave/protocol'
-import { Alert, App, Button, Empty, Input, Modal, Tag } from 'antd'
 import {
-  AppstoreOutlined,
-  ApiOutlined,
-  FileTextOutlined,
-  GithubOutlined,
-  ThunderboltOutlined,
-} from '@ant-design/icons'
+  Alert,
+  App,
+  Button,
+  Checkbox,
+  Empty,
+  Collapse,
+  Form,
+  Input,
+  List,
+  Modal,
+  Tag,
+  Typography,
+} from 'antd'
+import { GithubOutlined } from '@ant-design/icons'
 import { decodeFile, errorMessage, request, resourceKey } from './api'
-
-export const resourceKinds = {
-  skill: {
-    label: 'Skills',
-    name: 'Skill',
-    icon: ThunderboltOutlined,
-  },
-  mcp: { label: 'MCP', name: 'MCP', icon: ApiOutlined },
-  instructions: {
-    label: '全局指令',
-    name: '全局指令',
-    icon: FileTextOutlined,
-  },
-  plugin: { label: '插件', name: '插件', icon: AppstoreOutlined },
-}
-
-export const kindOptions = (Object.keys(resourceKinds) as ResourceKind[]).map(
-  (value) => ({ label: resourceKinds[value].label, value }),
-)
+import { resourceKinds } from './shared-helpers'
 
 export function KindIcon({ kind }: { kind: ResourceKind }) {
-  const { icon: Icon } = resourceKinds[kind] ?? resourceKinds.plugin
+  const { icon: Icon, color, bg } = resourceKinds[kind] ?? resourceKinds.plugin
   return (
-    <span className="kind-icon" aria-hidden="true">
+    <span
+      className="grid place-items-center shrink-0 size-9 rounded-lg text-base"
+      style={{ color, background: bg }}
+      aria-hidden="true"
+    >
       <Icon />
     </span>
   )
 }
 
 export function KindTag({ kind }: { kind: ResourceKind }) {
-  return <Tag>{resourceKinds[kind]?.label ?? kind}</Tag>
+  return (
+    <Tag variant="filled" color={resourceKinds[kind]?.tag}>
+      {resourceKinds[kind]?.label ?? kind}
+    </Tag>
+  )
 }
 
 export function PageTitle({
@@ -56,18 +53,20 @@ export function PageTitle({
   actions,
 }: {
   title: string
-  description: string
+  description: ReactNode
   actions?: ReactNode
 }) {
   return (
-    <div className="page-title flex gap-4 justify-between items-start">
+    <div className="flex flex-wrap gap-4 justify-between items-start mb-4">
       <div>
-        <h1>{title}</h1>
-        <p>{description}</p>
+        <Typography.Title level={3} className="m-0!">
+          {title}
+        </Typography.Title>
+        <Typography.Text type="secondary" className="block mt-1">
+          {description}
+        </Typography.Text>
       </div>
-      {actions && (
-        <div className="flex flex-wrap gap-2 page-actions">{actions}</div>
-      )}
+      {actions && <div className="flex flex-wrap gap-2">{actions}</div>}
     </div>
   )
 }
@@ -78,13 +77,16 @@ export function Warnings({ warnings }: { warnings?: string[] }) {
     <Alert
       showIcon
       type="warning"
-      title="部分内容需要留意"
+      title="部分资源需要处理"
       description={
-        <ul className="m-0 pl-5">
-          {warnings.map((warning, index) => (
-            <li key={index}>{warning}</li>
-          ))}
-        </ul>
+        <List
+          size="small"
+          split={false}
+          dataSource={warnings}
+          renderItem={(warning) => (
+            <List.Item className="px-0! py-0.5!">{warning}</List.Item>
+          )}
+        />
       }
     />
   )
@@ -141,24 +143,25 @@ export function CandidateSelection({
     <div className="selection-list">
       {candidates.map((candidate) => (
         <div className="candidate-entry" key={candidate.id}>
-          <label className="selection-row">
-            <input
-              type="checkbox"
-              checked={decisions.has(candidate.id)}
-              onChange={(event) => toggle(candidate, event.target.checked)}
-            />
-            <KindIcon kind={candidate.resource.kind} />
-            <span className="flex-1 min-w-0">
-              <strong className="break-all">{candidate.resource.name}</strong>
-              <span className="block text-muted text-sm">
-                {names.get(candidate.targetId) ?? candidate.targetId}
+          <Checkbox
+            className="selection-row w-full"
+            checked={decisions.has(candidate.id)}
+            onChange={(event) => toggle(candidate, event.target.checked)}
+          >
+            <span className="flex items-center gap-3">
+              <KindIcon kind={candidate.resource.kind} />
+              <span className="flex-1 min-w-0">
+                <strong className="break-all">{candidate.resource.name}</strong>
+                <span className="block text-muted text-sm">
+                  {names.get(candidate.targetId) ?? candidate.targetId}
+                </span>
               </span>
+              {candidate.status === 'conflict' && (
+                <Tag color="orange">选择保留此版本</Tag>
+              )}
+              {candidate.status === 'same' && <Tag color="green">合并来源</Tag>}
             </span>
-            {candidate.status === 'conflict' && (
-              <Tag color="orange">选择保留此版本</Tag>
-            )}
-            {candidate.status === 'same' && <Tag color="green">合并来源</Tag>}
-          </label>
+          </Checkbox>
           {candidate.status === 'conflict' && (
             <CandidateContent resource={candidate.resource} />
           )}
@@ -179,16 +182,26 @@ function CandidateContent({ resource }: { resource: Resource }) {
     files.join('\n')
 
   return (
-    <details className="candidate-content">
-      <summary>查看{mainFile ? ` ${mainFile}` : '内容'}</summary>
-      <pre>{content || '没有可显示的文本内容'}</pre>
-    </details>
+    <Collapse
+      ghost
+      size="small"
+      className="candidate-content"
+      items={[
+        {
+          key: 'content',
+          label: `查看${mainFile ? ` ${mainFile}` : '内容'}`,
+          children: (
+            <Typography.Paragraph className="m-0! max-h-44 overflow-auto whitespace-pre-wrap font-mono text-xs wrap-anywhere">
+              {content || '没有可显示的文本内容'}
+            </Typography.Paragraph>
+          ),
+        },
+      ]}
+    />
   )
 }
 
-export function suggestedSelections(
-  candidates: ComparedCandidate[],
-): Selection[] {
+function suggestedSelections(candidates: ComparedCandidate[]): Selection[] {
   const conflicts = new Set(
     candidates
       .filter(({ status }) => status === 'conflict')
@@ -227,7 +240,7 @@ export function AddGithubDialog({
         selections: chosen,
       })
       onClose()
-      message.success('已从 GitHub 导入中央仓库')
+      message.success('已将 GitHub 资源导入中央仓库')
       await onDone()
     } catch (error) {
       message.error(errorMessage(error))
@@ -240,9 +253,9 @@ export function AddGithubDialog({
     <Modal
       open
       onCancel={onClose}
-      title="添加 GitHub 来源"
+      title="添加 GitHub 仓库"
       onOk={advance}
-      okText={preview ? `导入 ${chosen.length} 项` : '检查资源'}
+      okText={preview ? `导入 ${chosen.length} 项` : '预览资源'}
       cancelText="取消"
       width={610}
       confirmLoading={loading}
@@ -252,25 +265,33 @@ export function AddGithubDialog({
       cancelButtonProps={{ disabled: loading }}
       okButtonProps={{ disabled: preview ? !chosen.length : !url.trim() }}
     >
-      <label className="field-label" htmlFor="github-url">
-        <GithubOutlined /> GitHub 地址
-      </label>
-      <Input
-        className="mb-4"
-        id="github-url"
-        type="url"
-        placeholder="https://github.com/组织/仓库"
-        value={url}
-        disabled={loading}
-        onChange={(event) => {
-          setUrl(event.target.value)
-          setPreview(null)
-        }}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter' && !loading && url.trim() && !preview)
-            advance()
-        }}
-      />
+      <Form layout="vertical" component="div">
+        <Form.Item
+          label={
+            <span>
+              <GithubOutlined /> GitHub 地址
+            </span>
+          }
+          htmlFor="github-url"
+          className="mb-4!"
+        >
+          <Input
+            id="github-url"
+            type="url"
+            placeholder="https://github.com/组织/仓库"
+            value={url}
+            disabled={loading}
+            onChange={(event) => {
+              setUrl(event.target.value)
+              setPreview(null)
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !loading && url.trim() && !preview)
+                advance()
+            }}
+          />
+        </Form.Item>
+      </Form>
       {preview && (
         <>
           <Warnings warnings={preview.warnings} />
@@ -287,9 +308,11 @@ export function AddGithubDialog({
 }
 
 export function PageFailure({
+  title = '无法读取工作区',
   error,
   onRetry,
 }: {
+  title?: string
   error: string
   onRetry: () => void | Promise<void>
 }) {
@@ -297,7 +320,7 @@ export function PageFailure({
     <Alert
       showIcon
       type="error"
-      title="无法读取本机资源"
+      title={title}
       description={error}
       action={<Button onClick={onRetry}>重试</Button>}
     />

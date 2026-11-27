@@ -13,6 +13,7 @@ import { createHash } from 'node:crypto'
 import { workspaceState } from './workspace.js'
 import { inspectGithub, readGithub } from './github.js'
 import { pluginFromFiles } from './plugin.js'
+import { resourceMetadata } from './resource-description.js'
 import { validateImport } from './validation.js'
 import {
   compared,
@@ -250,6 +251,18 @@ export function createRepository(
         resources: resources.sort((a, b) =>
           resourceKey(a).localeCompare(resourceKey(b)),
         ),
+        resourceRevisions: Object.fromEntries(
+          resources.map((resource) => [
+            resourceKey(resource),
+            fingerprint(resource),
+          ]),
+        ),
+        resourceMeta: Object.fromEntries(
+          resources.map((resource) => [
+            resourceKey(resource),
+            resourceMetadata(resource),
+          ]),
+        ),
         sources: sources.map(sourceSummary),
       }))
     },
@@ -292,7 +305,18 @@ export function createRepository(
         return removed
       }, true)
     },
-    async save(resource: unknown, { replace = false, fromFile = false } = {}) {
+    async save(
+      resource: unknown,
+      {
+        replace,
+        fromFile,
+        revision,
+      }: {
+        replace?: boolean
+        fromFile?: boolean
+        revision?: string
+      } = {},
+    ) {
       const clean = normalizeResource(resource)
       if (fromFile) {
         if (clean.kind === 'plugin' && clean.format !== 'pi') {
@@ -307,7 +331,16 @@ export function createRepository(
         }
         validateImport(clean)
       }
-      return state(({ resources }) => upsert(resources, clean, replace), true)
+      return state(({ resources }) => {
+        if (revision !== undefined) {
+          const current = resources.find(
+            (item) => resourceKey(item) === resourceKey(clean),
+          )
+          if (!current || fingerprint(current) !== revision)
+            throw new Error('资源已被其他操作更新，请重新打开后再保存。')
+        }
+        return upsert(resources, clean, replace === true)
+      }, true)
     },
     async listSources() {
       return state(({ sources }) => sources.map(sourceSummary))

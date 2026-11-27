@@ -143,6 +143,55 @@ export function normalizeMcpConfig(config: unknown) {
   })
 }
 
+export function comparableMcpConfig(config: unknown) {
+  const normalized = normalizeMcpConfig(config)
+  const variable = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/u
+  if (normalized.command !== undefined) {
+    const forwarded = new Set(strings(normalized.envVars, 'envVars'))
+    const env = stringMap(normalized.env, portableVariable)
+    for (const [name, value] of Object.entries(env ?? {})) {
+      if (variable.exec(value)?.[1] !== name) continue
+      forwarded.add(name)
+      delete env?.[name]
+    }
+    return compact({
+      ...normalized,
+      env: stringMap(env),
+      envVars: forwarded.size ? [...forwarded].sort() : undefined,
+    })
+  }
+
+  const headers = stringMap(normalized.headers, portableVariable)
+  const envHeaders = new Map(
+    Object.entries(stringMap(normalized.envHeaders) ?? {}),
+  )
+  let bearerTokenEnvVar = normalized.bearerTokenEnvVar
+  for (const [header, value] of Object.entries(headers ?? {})) {
+    const token =
+      header === 'Authorization' &&
+      /^Bearer \$\{([A-Za-z_][A-Za-z0-9_]*)\}$/u.exec(value)?.[1]
+    if (
+      token &&
+      !envHeaders.has(header) &&
+      (bearerTokenEnvVar === undefined || bearerTokenEnvVar === token)
+    ) {
+      bearerTokenEnvVar = token
+    } else {
+      const name = variable.exec(value)?.[1]
+      if (!name || (envHeaders.has(header) && envHeaders.get(header) !== name))
+        continue
+      envHeaders.set(header, name)
+    }
+    delete headers?.[header]
+  }
+  return compact({
+    ...normalized,
+    headers: stringMap(headers),
+    envHeaders: stringMap(Object.fromEntries(envHeaders)),
+    bearerTokenEnvVar,
+  })
+}
+
 export function decodeServer(raw: unknown, target: McpTarget) {
   if (!object(raw)) throw new Error('需要对象格式的 MCP 配置')
   const { variant } = target.mcp ?? {}
@@ -232,21 +281,21 @@ export function decodeServer(raw: unknown, target: McpTarget) {
   })
 }
 
+export function mcpTransport(config: Record<string, unknown>): McpTransport {
+  if (config.type === 'sse') return 'sse'
+  return config.command !== undefined ? 'stdio' : 'streamable-http'
+}
+
 export function encodeServer(
   resource: Resource,
   target: McpTarget,
   previous: unknown = {},
   warnings: string[] = [],
 ): Record<string, unknown> {
-  const config = normalizeMcpConfig(resource.config)
+  const config = comparableMcpConfig(resource.config)
   const { variant } = target.mcp ?? {}
   if (!variant) throw new Error('缺少目标 MCP 格式')
-  const transport: McpTransport =
-    config.type === 'sse'
-      ? 'sse'
-      : config.command !== undefined
-        ? 'stdio'
-        : 'streamable-http'
+  const transport = mcpTransport(config)
   const local = transport === 'stdio'
   const codex = variant === 'codex'
   const opencode = variant.startsWith('opencode')
